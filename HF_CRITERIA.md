@@ -1,0 +1,81 @@
+# RWKV-7 HF 适配 — 优化准则(HF_CRITERIA)
+
+> 这是一份**门禁式 rubric**,用来持续把 HF 适配往「追平官方/Albatross」推。区别于
+> `BENCHMARK.md`(结果日志),本文件定义**准则本身 + 度量方法 + 现状 + 优化循环**。
+> 每次 `/loop` 触发:照「优化循环」跑一遍,找当前最大缺口,改一项,更新本文件状态。
+
+## 0. 范围
+HF 赛道 = 完整 spec 的**要求 1(训练+推理追平官方/Albatross)+ 要求 2(HF PEFT/RL 训练)**,
+外加 HF 侧的**要求 5(量化 w8/w4)**。vLLM/SGLang(3)、PP/TP/Zero(4 大部)、投机解码(6)是
+**单独赛道**,不在本文件,见 `memory: rwkv7-hf-adapter-fullspec`。
+
+## 1. 准则清单(每条 = 一个可度量门禁)
+
+状态图例:✅ 达标 / ⚠️ 部分 / ❌ 未做。基线参照 = 官方 `rwkv` 包(注:本机无 nvcc,官方只能跑
+torch 参考路径,偏慢;真·Albatross 基线待补)。
+
+### A. 正确性(精度对齐官方)
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| A1 top-5 命中 | fp32 100%、fp16≥90%、bf16≥80% | `tests/test_official_alignment.py` | ✅ V100 fp16 1.0 / 5070 fp32 1.0 |
+| A2 cosine | ≥ 0.9999 | 同上 | ✅ 0.9999977 |
+| A3 max_abs | fp32≤0.05、fp16≤0.15、bf16≤0.70 | 同上 | ✅ |
+| A4 greedy 窗口 | ≥ 64 token 逐 token 一致 | 同上 `--greedy-window 64` | ✅ 64/64 |
+| A5 save/reload roundtrip | 重载 logits max_abs ≈ 0 | `tests/test_reload_roundtrip.py` | ✅ 0.0 |
+
+### B. 推理性能(速度,各 bsz)
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| B1 prefill tok/s | HF ≥ 官方(向量化 chunk) | `bench/bench_speed.py --backend both` | ✅ HF >> 官方 torch-ref |
+| B2 decode bsz=1 | native backend ≥ 官方 | `bench/bench_native_decode.py` | ✅ V100 native_graph 255(2.77×)/5070 395(4×) |
+| B3 decode 各 bsz(1/2/4/8) | 近线性 scale,每档 ≥ 官方 | `bench/bench_batch*.py` / batch sweep | ⚠️ 单流达标,批量官方基线待补 |
+| B4 generate 默认即快 | `model.generate` 走 fast-token | `bench/bench_generate_fast_path.py` | ✅ `RWKV7_FAST_FORWARD=1` 默认路由 |
+
+### C. 显存
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| C1 peak VRAM | HF ≤ 1.1× 官方 | `bench_speed.py` peak_vram | ✅ 0.1B ≈ 持平 |
+
+### D. 训练(要求 1 训练 + 要求 2)
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| D1 PEFT LoRA | forward/loss/backward 非零梯度 | `tests/test_peft_lora.py` | ✅ |
+| D2 TRL SFT smoke | SFTTrainer 跑通小数据 | `tests/test_hf_training_smoke.py` | ✅ |
+| D3 RL 库(PPO/DPO) | DPO/PPO smoke 跑通 | (缺)需新增 `tests/test_rl_smoke.py` | ❌ |
+| D4 全量训练吞吐 | 追平 RWKV-LM/Albatross 训练 | (缺)需训练 bench + 官方基线 | ❌ 未对标 |
+
+### E. 量化(要求 5,HF 侧)
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| E1 w8 推理 | 显存↓、速度≥fp16、精度≈Q8_K_M | `bench/bench_quantization.py` | ❌ 仅「检测+回退」,无真 w8 加速 |
+| E2 w4 推理 | 显存↓、速度≥fp16、精度≈Q4_K_M | 同上 | ❌ 同上 |
+| E3 bitsandbytes 加载 | 8bit/4bit load+forward 正确 | `tests/test_quantized_inference.py` | ⚠️ V100 有;Windows/sm_120 待验 |
+
+### F. 硬件 / 兼容
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| F1 多卡验证 | Pascal→Blackwell 都跑通 | 各卡跑测试套 | ⚠️ 仅 V100(sm_70)+ 5070(sm_120) |
+| F2 AMD | 能跑(ROCm/DirectML) | — | ❌ |
+| F3 HF API 契约 | resize/generate/beam/grad_ckpt 合规 | `tests/test_hf_api_contract.py` | ✅ |
+| F4 13.3B | 转换+smoke | `bench/bench_larger_model_smoke.py` | ❌ 全仓无覆盖(需量化) |
+
+### G. 工程化
+| 门禁 | 目标 | 度量 | 现状 |
+|---|---|---|---|
+| G1 测试套件全绿 | 核心测试在目标卡 pass | `pytest tests/` | ⚠️ V100 绿;Blackwell 待跑 |
+| G2 文档 | model card + 本准则 + BENCHMARK | — | ⚠️ 进行中 |
+
+## 2. 优化循环(每次 `/loop` 照此执行)
+1. **度量**:在当前卡(V100 或 5070)跑准则里**状态非 ✅** 且**本机可做**的门禁,记录数字到
+   `bench/results.jsonl`。
+2. **找最大缺口**:挑「价值 ÷ 工作量」最高的一项(优先 D3/D4 训练、E1/E2 量化、F1 多卡、F4 13.3B)。
+3. **改一项**:实现/修复/补测试,只动一项,保持其余不退步。
+4. **复测**:重跑该门禁 + 受影响的相邻门禁(如改 decode 要复测 A 精度 + B 速度)。
+5. **更新本文件**:把该项状态从 ❌/⚠️ 推向 ✅,记录数字。
+6. **提交**:`git commit`(分支 `wangyue/hf-criteria`)。
+
+## 3. 优先级建议(价值÷工作量,本机可行)
+1. **F1 Blackwell 全测试**(把 main 的测试套在 5070 跑一遍,记录 pass/fail)——最快暴露 sm_120 缺口。
+2. **E1/E2 量化**(w8/w4 加速路径 + 精度对标 llama.cpp Q*_K_M)——解锁 7.2B/13.3B,50 系独门。
+3. **D3 RL smoke**(DPO/PPO)+ **D4 训练吞吐基线**——把训练赛道补上。
+4. **F4 13.3B** 转换/smoke(依赖 E 量化)。
