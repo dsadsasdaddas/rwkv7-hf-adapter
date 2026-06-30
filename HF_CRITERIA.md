@@ -49,7 +49,7 @@ torch 参考路径,偏慢;真·Albatross 基线待补)。
 |---|---|---|---|
 | E1 w8 推理 | 显存↓、速度≥fp16、精度≈Q8_K_M | `bench/bench_quantization.py` | ❌ 仅「检测+回退」,无真 w8 加速 |
 | E2 w4 推理 | 显存↓、速度≥fp16、精度≈Q4_K_M | 同上 | ❌ 同上 |
-| E3 bitsandbytes 加载 | 8bit/4bit load+forward 正确 | `tests/test_quantized_inference.py` | ⚠️ V100 有;Windows/sm_120 待验 |
+| E3 bitsandbytes 加载 | 8bit/4bit load+forward 正确 | `tests/test_quantized_inference.py` | ✅ V100 + **5070(sm_120)8bit/4bit(nf4)均 PASS** |
 
 ### F. 硬件 / 兼容
 | 门禁 | 目标 | 度量 | 现状 |
@@ -97,3 +97,15 @@ torch 参考路径,偏慢;真·Albatross 基线待补)。
 **结论**:main 的 HF 后端(fast-token native_graph 多 batch + state cache + 训练)在 **Blackwell sm_120 上核心全绿**。
 **本轮未跑/已知缺口**:`test_quantized_inference.py`(E3,bitsandbytes 在 Windows/sm_120 待验,预期可能炸);13.3B(F4);Pascal/Ampere/Ada/H100/AMD(F1/F2)。
 **下一轮候选**:E3 量化在 5070 的可用性 → 若 bitsandbytes 不可用,转向 torchao/HFQuanto 的 w8/w4 路径(E1/E2)。
+
+### 2026-07-01 — E3 量化在 Blackwell(sm_120)可用 ✅
+装 `bitsandbytes 0.49.2`(Windows 直装、import OK),跑 `test_quantized_inference.py`(0.1B, fp16):
+
+| 量化 | footprint | peak VRAM | 首 token | 结果 |
+|---|---|---|---|---|
+| fp16(基线) | ~336 MB | — | 4171 | — |
+| **8bit** | 278.4 MB | 320.4 MB | 4171 | ✅ PASS |
+| **4bit nf4** | 235.3 MB | 259.6 MB | 4171 | ✅ PASS |
+
+显存随量化档位相应下降,首 token 跨档位一致(精度良好)。**E3 在 Blackwell 达标。**
+**仍欠(E1/E2)**:① 量化下的 **速度**——main 的 fast-token(native_jit/graph)对量化模型会回退到 FLA 慢路径,需做"量化 + 快速 decode"联合路径才能"速度≥fp16";② 精度对标 llama.cpp **Q*_K_M**(bnb 的 nf4/fp4 ≠ llama.cpp 量化体系,需另评);③ F4 13.3B 现在具备前置(4bit 下 ~7.5GB,8GB borderline 可试)。
