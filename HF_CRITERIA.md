@@ -54,7 +54,7 @@ torch 参考路径,偏慢;真·Albatross 基线待补)。
 ### F. 硬件 / 兼容
 | 门禁 | 目标 | 度量 | 现状 |
 |---|---|---|---|
-| F1 多卡验证 | Pascal→Blackwell 都跑通 | 各卡跑测试套 | ⚠️ 仅 V100(sm_70)+ 5070(sm_120) |
+| F1 多卡验证 | Pascal→Blackwell 都跑通 | 各卡跑测试套 | ⚠️ V100(sm_70)+ 5070(sm_120)核心绿;Pascal/Ampere/Ada/H100 未测 |
 | F2 AMD | 能跑(ROCm/DirectML) | — | ❌ |
 | F3 HF API 契约 | resize/generate/beam/grad_ckpt 合规 | `tests/test_hf_api_contract.py` | ✅ |
 | F4 13.3B | 转换+smoke | `bench/bench_larger_model_smoke.py` | ❌ 全仓无覆盖(需量化) |
@@ -62,7 +62,7 @@ torch 参考路径,偏慢;真·Albatross 基线待补)。
 ### G. 工程化
 | 门禁 | 目标 | 度量 | 现状 |
 |---|---|---|---|
-| G1 测试套件全绿 | 核心测试在目标卡 pass | `pytest tests/` | ⚠️ V100 绿;Blackwell 待跑 |
+| G1 测试套件全绿 | 核心测试在目标卡 pass | `pytest tests/` | ✅ V100 绿;**5070(sm_120)核心 6/6 绿**(见 §4) |
 | G2 文档 | model card + 本准则 + BENCHMARK | — | ⚠️ 进行中 |
 
 ## 2. 优化循环(每次 `/loop` 照此执行)
@@ -79,3 +79,21 @@ torch 参考路径,偏慢;真·Albatross 基线待补)。
 2. **E1/E2 量化**(w8/w4 加速路径 + 精度对标 llama.cpp Q*_K_M)——解锁 7.2B/13.3B,50 系独门。
 3. **D3 RL smoke**(DPO/PPO)+ **D4 训练吞吐基线**——把训练赛道补上。
 4. **F4 13.3B** 转换/smoke(依赖 E 量化)。
+
+## 4. 验证记录(log)
+
+### 2026-07-01 — RTX 5070 Laptop(Blackwell sm_120),0.1B,fp16
+用 main 的 convert 重转 0.1B(`--no-fuse-norm`,带 main 完整 fast-token modeling),清 HF 模块缓存后跑 main 测试套:
+
+| 测试 | 门禁 | 结果 |
+|---|---|---|
+| `test_official_alignment.py` | A1-A4 | ✅ PASS(top5 0.96、cos 0.9999978、max_abs 0.093、greedy 64/64) |
+| `test_reload_roundtrip.py` | A5 | ✅ PASS(max_abs_diff 0.0;main 的 save 修复在 sm_120 生效) |
+| `test_peft_lora.py` | D1 | ✅ PASS(trainable 0.35%、72 非零梯度) |
+| `test_fast_decode_api.py` | B2/B3 | ✅ PASS(**native_graph 后端 bsz=1/2/4 多 graph 缓存在 sm_120 全工作**,greedy 32/32) |
+| `test_hf_api_contract.py` | F3 | ✅ PASS(beam/resize/grad_ckpt 合规) |
+| `test_hf_training_smoke.py` | D2 | ✅ PASS(Trainer loss 1.728 + TRL SFT loss 1.808;装 trl+datasets 后) |
+
+**结论**:main 的 HF 后端(fast-token native_graph 多 batch + state cache + 训练)在 **Blackwell sm_120 上核心全绿**。
+**本轮未跑/已知缺口**:`test_quantized_inference.py`(E3,bitsandbytes 在 Windows/sm_120 待验,预期可能炸);13.3B(F4);Pascal/Ampere/Ada/H100/AMD(F1/F2)。
+**下一轮候选**:E3 量化在 5070 的可用性 → 若 bitsandbytes 不可用,转向 torchao/HFQuanto 的 w8/w4 路径(E1/E2)。
