@@ -40,3 +40,41 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 - `test_device_map_generate`:**skip**(需 ≥2 CUDA 设备,单 5070 不满足)。
 - `test_deepspeed_configs`(Zero2/3):**deepspeed MISSING**(本机未装,Zero 训练无法跑;且 Zero 通常需多卡)。配置文件校验见上(exit code)。
 - 这两项需**多卡 + deepspeed** 环境,单 5070 做不了(撞墙)。50 系单卡能覆盖的是推理 + native 训练 backward。
+
+## 50 系数据汇总(RTX 5070 Laptop, sm_120, 8GB, fp16, 0.1B 为主)
+
+### 推理速度
+| 路径 | prefill tok/s | decode bsz=1 tok/s | TPOT ms/tok |
+|---|---|---|---|
+| FLA HF(chunk,eager) | ~16980 | ~37 | ~27(框架开销大) |
+| FLA HF + native_graph(CUDA graph) | — | ~395 | ~2.5 |
+| FLA HF + rwkv7_forward_token | — | ~248 | ~4.0(TPOT p50) |
+| Native 模型 generate(JIT) | —(顺序 prefill) | ~86 | — |
+| 官方 rwkv(torch-ref,本机无 nvcc) | ~220 | ~99 | ~10 |
+
+### TTFT(单次 prefill,bench_ttft_tpot)
+| ISL | p50 | p99 |
+|---|---|---|
+| 512 | 36ms | 49ms |
+| 2048 | 71ms | 80ms |
+
+### 量化(quant-fast-forward,4bit nf4)
+| 档 | footprint | peak VRAM | fast_forward | 状态 |
+|---|---|---|---|---|
+| fp16 | ~336MB | — | — | 基线 |
+| 4bit nf4 | 242.9MB | 274.3MB | backend=fla, max_abs 0.078 | ✅ PASS |
+（注:之前无 fast-forward 时 4bit decode 45ms/tok=22 tok/s,慢 13×;main 的 quant-fast-forward 已加快速路径。)
+
+### 显存(decode-only)
+- FLA HF decode-only: ~376MB(0.1B,权重 ~336 + 开销 ~40)
+- 2.9B fp16: OOM(>8GB,需量化)
+
+### 投机解码(0.4B target + 0.1B draft)
+- acceptance_rate 82.4%,target_forward 8 / draft_forward 20
+
+### 精度
+- native vs FLA: cos=1.0(0.1B/0.4B/1.5B),generate token-identical
+
+### 训练
+- FLA backward: ❌(kernel 128KB > 99KB shared mem)
+- Native backward: ✅(workaround,纯 PyTorch)
