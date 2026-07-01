@@ -229,4 +229,21 @@ main `7c1d46d Add native graph fused WAG LoRA probe (#53)`(第 5 个接进 graph
 
 → **三个尺寸都没过 1.0×**,确认是真实的负收益,不是 toy size 假象。之前猜的"WAG LoRA 大模型可能翻正"被 2.9B 数据削弱(非单调,2.9B 回降)—— 大概率就是 ~0.8-0.88× 的稳定负收益,7.2B+ 也不乐观。output-project 更糟,随模型变大单调恶化。**8GB 5070(max fp16 2.9B)上这两个融合就是别开。**
 
+### 2026-07-01 — main 315e502 fused recurrent+output 在 5070 = 最强的正收益融合(1.12×)
+main `315e502 Add fused recurrent output backend probe (#54)`:把**两个已验证的赢家**(recurrent + output-prep)融进**一个** kernel(`fused_recurrent_update.py` 扩展)。`bench_native_graph_fused_recurrent_output.py` A/B 在 5070:
+
+| 场景 | speedup vs 二者分别 OFF | greedy |
+|---|---|---|
+| 0.1B bsz1 | **1.119×** | 64/64 |
+| 0.1B bsz8 | **1.124×** | 512/512 |
+| 1.5B bsz1 | **1.046×** | 32/32 |
+
+→ **recurrent+output 深融 = +11.9%**,比二者分开各贡献的 ~5% **累加放大**(消掉了 recurrent→output 中间交接)。这是几轮负收益后**第一个真正强的端到端正融合**,cos=1.0 全对。
+
+**规律现在彻底清晰(给 main 的明确建议):**
+- ✅ **沿 recurrent→output 数据通路深融(都 Triton-friendly)→ 累加赢**:recurrent+output **1.12×**(应该继续往 FFN-shift 方向深融)
+- ❌ **把赢家和 cuBLAS matmul 绑一起 → 亏**:output+o_proj(output-project 0.96×)、+WAG LoRA matmul(0.82×)
+- ❌ **weight 量化提速 → 亏**(memory-bound,cuBLAS GEMV 太强)
+- 即:**只融 Triton 擅长的点积/norm/state-update,别碰 cuBLAS 强项的大 matmul(o_proj / projection GEMV)。** 这条规则能解释 5070 上所有融合的赢/亏。
+
 **1.5B config bug(已修)**:`rwkv7-g1g-1.5b-hf/config.json` 的 `model_type` 是 `rwkv7`(FLA 内置注册类型)而非 `rwkv7_hf_adapter`,导致 transformers 加载 FLA 自带 RWKV7(无 `rwkv7_forward_token`),1.5B 所有 fast-token/graph bench 全挂。其余 0.1B/0.4B/2.9B 均 `rwkv7_hf_adapter` 正常。**已本地 patch 为 `rwkv7_hf_adapter`**。注:当前 `scripts/convert_rwkv7_to_hf.py` 第 209 行**已经**正确写 `rwkv7_hf_adapter`,所以 1.5B 是**旧转换残留**(更早的脚本转的),非脚本 bug;重新跑 convert 也会修好。
