@@ -236,8 +236,24 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
         """Return the backend used by the previous native-model decode call."""
         return getattr(self, "_rwkv7_native_model_last_decode_backend", None)
 
+    def _native_model_quantized(self) -> bool:
+        """True if attention projections were replaced by bitsandbytes.
+
+        The JIT decode path extracts raw ``.weight`` tensors into packs, which
+        cannot represent bnb-quantized params (Linear4/8bit). When quantized,
+        decode must use the eager per-token path whose module calls invoke the
+        bnb linears. Detected by class name to avoid importing bitsandbytes.
+        """
+        try:
+            proj = self.model.layers[0].attn.r_proj
+            return type(proj).__name__ in {"Linear4bit", "Linear8bit", "Linear8bitLt"}
+        except Exception:
+            return False
+
     def _native_jit_packs(self):
         if not _native_model_jit_enabled() or _native_jit_extract is None or _native_jit_step_batched is None:
+            return None
+        if self._native_model_quantized():
             return None
         weight = self.model.embeddings.weight
         key = (weight.device.type, weight.device.index, weight.dtype)

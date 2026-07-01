@@ -29,15 +29,11 @@ def attn_step(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tensor,
     xg = x + xx * layer.x_g.reshape(-1)
 
     r = layer.r_proj(xr)
-    w = F.linear(torch.tanh(F.linear(xw, layer.w_lora.lora[0].weight)),
-                 layer.w_lora.lora[2].weight, layer.w_lora.lora[2].bias)
+    w = layer.w_lora.lora[2](torch.tanh(layer.w_lora.lora[0](xw)))
     k = layer.k_proj(xk)
     v = layer.v_proj(xv)
-    a = torch.sigmoid(layer.a_lora.lora[2].bias +
-                      F.linear(F.linear(xa, layer.a_lora.lora[0].weight),
-                               layer.a_lora.lora[2].weight))
-    g = F.linear(torch.sigmoid(F.linear(xg, layer.g_lora.lora[0].weight)),
-                 layer.g_lora.lora[2].weight)
+    a = torch.sigmoid(layer.a_lora.lora[2](layer.a_lora.lora[0](xa)))
+    g = layer.g_lora.lora[2](torch.sigmoid(layer.g_lora.lora[0](xg)))
 
     kk = F.normalize((k * layer.k_k).view(H, N), dim=-1, p=2).view(H * N)
     k = k * (1 + (a - 1) * layer.k_a)
@@ -45,9 +41,7 @@ def attn_step(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tensor,
         v_first = v
     else:
         v = v + (v_first - v) * torch.sigmoid(
-            layer.v_lora.lora[2].bias +
-            F.linear(F.linear(xv, layer.v_lora.lora[0].weight),
-                     layer.v_lora.lora[2].weight))
+            layer.v_lora.lora[2](layer.v_lora.lora[0](xv)))
     w = torch.exp(-EXP_HALF * torch.sigmoid(w.float()))
 
     vk = v.view(H, N, 1) @ k.view(H, 1, N)
@@ -68,8 +62,8 @@ def ffn_step(layer, x: torch.Tensor, x_prev: torch.Tensor):
     """Port of RWKV_x070_CMix_one. Returns (out, x_new_prev)."""
     xx = x_prev - x
     k = x + xx * layer.x_k
-    k = torch.relu(F.linear(k, layer.key.weight)) ** 2
-    return F.linear(k, layer.value.weight), x
+    k = torch.relu(layer.key(k)) ** 2
+    return layer.value(k), x
 
 
 def attn_step_batched(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tensor,
@@ -93,15 +87,11 @@ def attn_step_batched(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tenso
     xg = x + xx * layer.x_g.reshape(1, hidden)
 
     r = layer.r_proj(xr)
-    w = F.linear(torch.tanh(F.linear(xw, layer.w_lora.lora[0].weight)),
-                 layer.w_lora.lora[2].weight, layer.w_lora.lora[2].bias)
+    w = layer.w_lora.lora[2](torch.tanh(layer.w_lora.lora[0](xw)))
     k = layer.k_proj(xk)
     v = layer.v_proj(xv)
-    a = torch.sigmoid(layer.a_lora.lora[2].bias +
-                      F.linear(F.linear(xa, layer.a_lora.lora[0].weight),
-                               layer.a_lora.lora[2].weight))
-    g = F.linear(torch.sigmoid(F.linear(xg, layer.g_lora.lora[0].weight)),
-                 layer.g_lora.lora[2].weight)
+    a = torch.sigmoid(layer.a_lora.lora[2](layer.a_lora.lora[0](xa)))
+    g = layer.g_lora.lora[2](torch.sigmoid(layer.g_lora.lora[0](xg)))
 
     kk = F.normalize((k * layer.k_k.reshape(1, hidden)).view(B, H, N), dim=-1, p=2).view(B, hidden)
     k = k * (1 + (a - 1) * layer.k_a.reshape(1, hidden))
@@ -109,9 +99,7 @@ def attn_step_batched(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tenso
         v_first = v
     else:
         v = v + (v_first - v) * torch.sigmoid(
-            layer.v_lora.lora[2].bias +
-            F.linear(F.linear(xv, layer.v_lora.lora[0].weight),
-                     layer.v_lora.lora[2].weight))
+            layer.v_lora.lora[2](layer.v_lora.lora[0](xv)))
     w = torch.exp(-EXP_HALF * torch.sigmoid(w.float()))
 
     vk = v.view(B, H, N, 1) @ k.view(B, H, 1, N)
@@ -132,8 +120,8 @@ def ffn_step_batched(layer, x: torch.Tensor, x_prev: torch.Tensor):
     """Batched RWKV_x070_CMix_one. Returns (out, x_new_prev)."""
     xx = x_prev - x
     k = x + xx * layer.x_k.reshape(1, -1)
-    k = torch.relu(F.linear(k, layer.key.weight)) ** 2
-    return F.linear(k, layer.value.weight), x
+    k = torch.relu(layer.key(k)) ** 2
+    return layer.value(k), x
 
 
 def _init_state_batched(model, batch_size: int, device, dtype):
