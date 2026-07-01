@@ -288,13 +288,11 @@ class _RWKV7NativeGraphTokenRunner:
             self._copy_cache_tensor(self.xpf[li], state.get("ffn_state"))
 
     def bind_cache(self, past_key_values: "RWKV7StateCache") -> None:
+        # Copy (not view) so each cache is independent — safe when this runner is
+        # reused across multiple inputs (dynamic batching). Fixes view aliasing.
         for li, p in enumerate(self.packs):
             layer_idx = int(p[0])
             state = past_key_values._ensure_layer(layer_idx)
-            # FLA cache layout is transposed relative to the native matmul layout.
-            # Copy (not view) so each cache is independent — safe when this runner
-            # is reused across multiple inputs (dynamic batching). Trades the
-            # copy_from_cache no-op fast path for correctness (fixes view aliasing).
             state["recurrent_state"] = self.state[li].transpose(-1, -2).unsqueeze(0).contiguous()
             state["conv_state"] = self.xpa[li].unsqueeze(0).clone()
             state["ffn_state"] = self.xpf[li].unsqueeze(0).clone()
@@ -384,12 +382,11 @@ class _RWKV7NativeGraphBatchedTokenRunner:
             self._copy_cache_tensor(self.xpf[li], state.get("ffn_state"))
 
     def bind_cache(self, past_key_values: "RWKV7StateCache") -> None:
+        # Copy (not view) for independence when reused across inputs (dynamic
+        # batching); fixes view aliasing. Trades the no-op copy fast path.
         for li, p in enumerate(self.packs):
             layer_idx = int(p[0])
             state = past_key_values._ensure_layer(layer_idx)
-            # FLA cache layout is transposed relative to the native matmul layout.
-            # Copy (not view) for independence when reused across inputs (dynamic
-            # batching); fixes view aliasing. Trades the no-op copy fast path.
             state["recurrent_state"] = self.state[li].transpose(-1, -2).contiguous()
             state["conv_state"] = self.xpa[li].clone()
             state["ffn_state"] = self.xpf[li].clone()
