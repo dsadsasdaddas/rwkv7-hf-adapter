@@ -33,6 +33,70 @@ except Exception:  # pragma: no cover - optional native acceleration
     _native_jit_extract = None
     _native_jit_step_batched = None
 
+try:  # pragma: no cover - optional Cache base for HF GenerationMixin/Trainer compat
+    from fla.models.utils import Cache as _FLACache
+except Exception:  # pragma: no cover
+    class _FLACache:  # minimal fallback so native_model imports without fla
+        pass
+
+
+class NativeRWKV7Cache(_FLACache):
+    """HF Cache-contract wrapper for ``NativeRWKV7ForCausalLM`` recurrent state.
+
+    Native decode threads ``(state, xpa, xpf, v_first)`` as its recurrent
+    cache (state=list per layer, xpa/xpf=list per layer, v_first is cross-layer).
+    That raw tuple does not satisfy the HF ``Cache`` contract that
+    ``GenerationMixin``/``Trainer`` want (``get_seq_length`` etc.). This wrapper
+    stores the tuple but subclasses the FLA/HF ``Cache`` base so it is accepted,
+    and stays **iterable** so existing tuple-unpacking in ``forward`` and
+    ``_reorder_cache`` keeps working unchanged.
+    """
+
+    is_compileable = True
+
+    def __init__(self, state=None, xpa=None, xpf=None, v_first=None, seen_tokens: int = 0):
+        # Skip _FLACache.__init__: it allocates CacheLayer wrappers that RWKV
+        # recurrent decode does not need (mirrors RWKV7StateCache).
+        self._state = state
+        self._xpa = xpa
+        self._xpf = xpf
+        self._v_first = v_first
+        self._seen_tokens = int(seen_tokens)
+
+    def __iter__(self):
+        yield self._state
+        yield self._xpa
+        yield self._xpf
+        yield self._v_first
+
+    def __len__(self) -> int:
+        return 4
+
+    def get_seq_length(self, layer_idx: int | None = 0, cache_position=None) -> int:
+        return self._seen_tokens
+
+    def to_legacy_cache(self):
+        return tuple(self)
+
+    @classmethod
+    def from_legacy_cache(cls, legacy, seen_tokens: int = 0):
+        if isinstance(legacy, NativeRWKV7Cache):
+            return legacy
+        state, xpa, xpf, v_first = legacy
+        return cls(state, xpa, xpf, v_first, seen_tokens=seen_tokens)
+
+
+def _cache_seen(past_key_values) -> int:
+    """Best-effort seen-token count from a native cache (wrapper or raw tuple)."""
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        try:
+            return int(past_key_values.get_seq_length())
+        except Exception:
+            return 0
+    return 0
+
 
 def _native_model_jit_enabled() -> bool:
     return os.environ.get("RWKV7_NATIVE_MODEL_JIT", "1") not in _FALSE_VALUES
@@ -282,12 +346,14 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
             state, xpa, xpf, v_first = _init_state_batched(self, input_ids.shape[0], device, dtype)
             toks = input_ids
             use_jit = False
+            seen = int(toks.shape[1])
         else:
             state, xpa, xpf, v_first = past_key_values
             toks = input_ids[:, -1:]
             use_jit = True
+            seen = _cache_seen(past_key_values) + int(toks.shape[1])
         logits, state, xpa, xpf, v_first = self._run(toks, state, xpa, xpf, v_first, use_jit=use_jit)
-        new_cache = (state, xpa, xpf, v_first) if use_cache else None
+        new_cache = NativeRWKV7Cache(state, xpa, xpf, v_first, seen_tokens=seen) if use_cache else None
         if not return_dict:
             return (logits, new_cache) if use_cache else (logits,)
         return CausalLMOutputWithPast(logits=logits, past_key_values=new_cache)
@@ -299,11 +365,13 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
             return None
         state, xpa, xpf, v_first = past_key_values
         index = beam_idx.to(v_first.device)
-        return (
+        seen = _cache_seen(past_key_values)
+        return NativeRWKV7Cache(
             [s.index_select(0, index.to(s.device)) for s in state],
             [x.index_select(0, index.to(x.device)) for x in xpa],
             [x.index_select(0, index.to(x.device)) for x in xpf],
             v_first.index_select(0, index),
+            seen_tokens=seen,
         )
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
