@@ -35,3 +35,8 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 **结论(Blackwell 训练)**:
 - FLA wrapper 训练 backward ❌(fla kernel 超 99KB,upstream fla 须修)。
 - **Native 模型训练 backward ✅(50 系用 native 做训练)**。
+
+### 2026-07-01 — ⏭️ device_map / deepspeed 在 5070 撞墙(单卡 + 无 deepspeed)
+- `test_device_map_generate`:**skip**(需 ≥2 CUDA 设备,单 5070 不满足)。
+- `test_deepspeed_configs`(Zero2/3):**deepspeed MISSING**(本机未装,Zero 训练无法跑;且 Zero 通常需多卡)。配置文件校验见上(exit code)。
+- 这两项需**多卡 + deepspeed** 环境,单 5070 做不了(撞墙)。50 系单卡能覆盖的是推理 + native 训练 backward。
