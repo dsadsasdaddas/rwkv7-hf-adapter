@@ -292,9 +292,12 @@ class _RWKV7NativeGraphTokenRunner:
             layer_idx = int(p[0])
             state = past_key_values._ensure_layer(layer_idx)
             # FLA cache layout is transposed relative to the native matmul layout.
-            state["recurrent_state"] = self.state[li].transpose(-1, -2).unsqueeze(0)
-            state["conv_state"] = self.xpa[li].unsqueeze(0)
-            state["ffn_state"] = self.xpf[li].unsqueeze(0)
+            # Copy (not view) so each cache is independent — safe when this runner
+            # is reused across multiple inputs (dynamic batching). Trades the
+            # copy_from_cache no-op fast path for correctness (fixes view aliasing).
+            state["recurrent_state"] = self.state[li].transpose(-1, -2).unsqueeze(0).contiguous()
+            state["conv_state"] = self.xpa[li].unsqueeze(0).clone()
+            state["ffn_state"] = self.xpf[li].unsqueeze(0).clone()
             state["attn_state"] = None
 
     def replay(self, token: torch.LongTensor, past_key_values: "RWKV7StateCache") -> torch.Tensor:
@@ -302,7 +305,7 @@ class _RWKV7NativeGraphTokenRunner:
         self.tok_id.copy_(token.reshape(1))
         self.graph.replay()
         self.bind_cache(past_key_values)
-        return self.logits.view(1, 1, -1)
+        return self.logits.view(1, 1, -1).clone()
 
 
 class _RWKV7NativeGraphBatchedTokenRunner:
@@ -385,9 +388,11 @@ class _RWKV7NativeGraphBatchedTokenRunner:
             layer_idx = int(p[0])
             state = past_key_values._ensure_layer(layer_idx)
             # FLA cache layout is transposed relative to the native matmul layout.
-            state["recurrent_state"] = self.state[li].transpose(-1, -2)
-            state["conv_state"] = self.xpa[li]
-            state["ffn_state"] = self.xpf[li]
+            # Copy (not view) for independence when reused across inputs (dynamic
+            # batching); fixes view aliasing. Trades the no-op copy fast path.
+            state["recurrent_state"] = self.state[li].transpose(-1, -2).contiguous()
+            state["conv_state"] = self.xpa[li].clone()
+            state["ffn_state"] = self.xpf[li].clone()
             state["attn_state"] = None
 
     def replay(self, token: torch.LongTensor, past_key_values: "RWKV7StateCache") -> torch.Tensor:
@@ -397,7 +402,7 @@ class _RWKV7NativeGraphBatchedTokenRunner:
         self.tok_id.copy_(token.reshape(self.batch_size))
         self.graph.replay()
         self.bind_cache(past_key_values)
-        return self.logits.view(self.batch_size, 1, -1)
+        return self.logits.view(self.batch_size, 1, -1).clone()
 
 
 class RWKV7StateCache(_FLACache):
