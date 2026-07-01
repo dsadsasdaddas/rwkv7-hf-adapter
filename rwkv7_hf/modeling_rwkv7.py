@@ -1280,6 +1280,15 @@ class RWKV7ForCausalLM(_RWKV7ForCausalLM):
         return None
 
     def forward(self, *args, **kwargs):
+        # Normalize 1-D input_ids [batch] -> [batch, 1]. The fast-token path
+        # accepts [batch] directly, but the FLA fallback (e.g. quantized models,
+        # where fast-token is rejected) embeds 1-D to a 2-D hidden and crashes in
+        # fla attention (expects [batch, seq, hidden]). [batch, 1] is accepted by
+        # both paths.
+        if args and isinstance(args[0], torch.Tensor) and args[0].dim() == 1:
+            args = (args[0].unsqueeze(1),) + tuple(args[1:])
+        elif isinstance(kwargs.get("input_ids"), torch.Tensor) and kwargs["input_ids"].dim() == 1:
+            kwargs["input_ids"] = kwargs["input_ids"].unsqueeze(1)
         use_cache = kwargs.get("use_cache")
         effective_use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
         if effective_use_cache and _fast_cache_enabled():
