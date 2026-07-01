@@ -1,95 +1,81 @@
-# RWKV-7 HF Adapter TODO / Contributor Roadmap
+# RWKV-7 HF Adapter TODO / 贡献者路线图
 
-This is the practical TODO list for contributors. It is intentionally **HF
-adapter only**: Transformers loading/generation, Trainer, PEFT, TRL, DeepSpeed,
-HF state-cache helpers, quantized HF inference, hardware validation, and
-production-readiness evidence.
+贡献者实操 TODO。范围严格 **HF 适配**:Transformers 加载/生成、Trainer、PEFT、TRL、DeepSpeed、HF state-cache helper、量化 HF 推理、硬件验证、生产就绪证据。
 
-Do not put native vLLM/SGLang work in this TODO. Those are separate projects.
+不要把 native vLLM/SGLang 工作放进本 TODO,那是独立项目。
 
-## Contribution rules
+> 缺口总览见 [`HF_CRITERIA.md`](HF_CRITERIA.md) §3、性能数字见 [`BENCHMARK.md`](BENCHMARK.md)、性能 kernel 路线见 [`FUSED_BACKEND.md`](FUSED_BACKEND.md)、整体状态见 [`HF_STATUS.md`](HF_STATUS.md)。本文件是这些文档的**实操展开**(做什么 + 怎么做 + 完成定义),不重复其内容。
 
-1. Keep changes scoped to the HF adapter unless the PR explicitly says it is a
-   benchmark or documentation-only update.
-2. Add or update tests for every behavior change.
-3. Record reproducible evidence for GPU work in `bench/results.jsonl` when the
-   command supports `--results`.
-4. Hardware PRs must state card name, driver, CUDA/ROCm, PyTorch, dtype, model
-   size, and exact command.
-5. Do not regress the V100 baseline while optimizing for newer cards.
-6. If a test is optional because a GPU/library is missing, make the skip explicit
-   and keep CPU/no-CUDA import paths green.
+## 贡献规则
 
-## P0: close the HF acceptance evidence
+1. 改动限定在 HF 适配,除非 PR 明确是 benchmark 或纯文档更新。
+2. 每个行为变更都补/更新测试。
+3. GPU 工作在命令支持 `--results` 时,把可复现证据写入 `bench/results.jsonl`。
+4. 硬件 PR 必须写明:卡名、驱动、CUDA/ROCm、PyTorch、dtype、模型尺寸、确切命令。
+5. 为新卡优化时不得回退 V100 基线。
+6. 测试因缺 GPU/库而 optional 时,skip 要显式,并保持 CPU / 无 CUDA import 路径绿灯。
 
-### 1. Large-model training matrix
+## P0:闭合 HF 验收证据
 
-Small-model PEFT/Trainer/TRL smokes exist. The next acceptance step is to run
-and record a model-size matrix.
+### 1. 大模型训练矩阵 【进行中】
 
-| Model size | PEFT | SFT | DPO | GRPO | ZeRO-2 | ZeRO-3 | Notes |
+小模型 PEFT/Trainer/TRL smoke 已有。下一步是跑并记录模型尺寸矩阵。
+
+| 模型尺寸 | PEFT | SFT | DPO | GRPO | ZeRO-2 | ZeRO-3 | 备注 |
 |---|---|---|---|---|---|---|---|
-| 0.4B | Needed | Needed | Needed | Needed | Needed | Needed | First real training target beyond 0.1B. |
-| 1.5B | Needed | Needed | Needed | Optional | Needed | Needed | Good V100 stress target. |
-| 2.9B | Needed | Needed | Optional | Optional | Needed | Needed | May require shorter sequence / grad accumulation tuning. |
-| 7B | Optional | Optional | Optional | Optional | Optional | Needed | Tiny ZeRO-3 smoke is enough initially. |
+| 0.4B | 进行中 | 进行中 | 待补 | 待补 | 待补 | 待补 | 0.1B 之外首个真实训练目标。 |
+| 1.5B | 进行中 | 进行中 | 待补 | 可选 | 待补 | 待补 | V100 压力目标。 |
+| 2.9B | 待补 | 待补 | 可选 | 可选 | 待补 | 待补 | 可能需短序列 / grad accumulation 调参。 |
+| 7B | 可选 | 可选 | 可选 | 可选 | 可选 | 待补 | 先做 ZeRO-3 小 smoke。 |
 
-Definition of done:
+完成定义:
 
-- finite loss;
-- trainable parameters change;
-- no silent NaN/Inf;
-- command and model path recorded;
-- result row appended to `bench/results.jsonl` when supported;
-- summary added to `BENCHMARK.md` or PR body.
+- 有限 loss;
+- trainable 参数变化;
+- 无静默 NaN/Inf;
+- 记录命令与模型路径;
+- 支持时追加 `bench/results.jsonl` 行;
+- 在 `BENCHMARK.md` 或 PR body 加摘要。
 
 ### 2. ZeRO checkpoint resume
 
-Add a dedicated smoke test for DeepSpeed resume behavior:
+补一个 DeepSpeed resume 专项 smoke:
 
-1. initialize HF Trainer + PEFT LoRA under ZeRO-2;
-2. train one step;
-3. save checkpoint;
-4. reinitialize model/trainer;
-5. resume from checkpoint;
-6. train one more step;
-7. assert finite loss, expected global step, and trainable parameter delta;
-8. repeat for ZeRO-3.
+1. ZeRO-2 下初始化 HF Trainer + PEFT LoRA;
+2. 训练一步;
+3. 保存 checkpoint;
+4. 重新初始化 model / trainer;
+5. 从 checkpoint resume;
+6. 再训一步;
+7. 断言有限 loss、预期 global step、trainable 参数 delta;
+8. ZeRO-3 重复。
 
-Suggested file:
+建议文件:`tests/test_deepspeed_resume_smoke.py`
+建议结果类型:`deepspeed_resume_smoke`
 
-- `tests/test_deepspeed_resume_smoke.py`
+### 3. 一键 HF 验收脚本
 
-Suggested result type:
+加脚本,让新贡献者不用读每个测试文件就能复现当前验收状态。
 
-- `deepspeed_resume_smoke`
-
-### 3. One-click HF acceptance scripts
-
-Add scripts so a new contributor can reproduce the current acceptance state
-without reading every test file.
-
-Suggested scripts:
+建议脚本:
 
 - `scripts/run_hf_acceptance.sh`
 - `scripts/run_hf_training_matrix.sh`
 - `scripts/run_zero_resume_smoke.sh`
 - `scripts/run_hardware_smoke.sh`
 
-Definition of done:
+完成定义:
 
-- scripts accept `MODEL`, `RESULTS`, `CUDA_VISIBLE_DEVICES`, and dtype-related
-  overrides;
-- scripts print environment metadata;
-- scripts fail fast on real failures but allow explicit optional skips;
-- docs show the minimal invocation.
+- 脚本接受 `MODEL`、`RESULTS`、`CUDA_VISIBLE_DEVICES` 及 dtype 相关 override;
+- 脚本打印环境元数据;
+- 真实失败快速报错,但允许显式 optional skip;
+- 文档给出最小调用示例。
 
-### 4. Card adaptation matrix
+### 4. 卡适配矩阵 【4090 进行中】
 
-Build a reproducible card matrix. The goal is production confidence across
-common professional and consumer hardware, not only one server.
+搭一个可复现的卡矩阵。目标是常见专业 / 消费硬件上的生产级信心,而不只是一台服务器。
 
-Minimum per-card smoke:
+每卡最小 smoke:
 
 ```bash
 python tests/smoke_hf_generate.py --model /path/to/model
@@ -99,7 +85,7 @@ python bench/bench_speed.py --hf-dir /path/to/model --backend hf --dtype fp16 --
 python bench/bench_batch_sweep.py --hf-dir /path/to/model --dtype fp16 --device cuda --results bench/results.jsonl
 ```
 
-Training-capable cards should also run:
+可训练卡还应跑:
 
 ```bash
 python tests/test_peft_lora.py --model /path/to/model --device cuda --attn-mode fused_recurrent
@@ -107,7 +93,7 @@ python tests/test_hf_training_smoke.py --model /path/to/model --device cuda --at
 python tests/test_hf_rl_training_smoke.py --model /path/to/model --device cuda --attn-mode fused_recurrent --backend dpo --results bench/results.jsonl
 ```
 
-Multi-GPU cards/nodes should run:
+多卡 / 多机还应跑:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 tests/test_deepspeed_training_smoke.py \
@@ -121,117 +107,95 @@ torchrun --standalone --nproc_per_node=2 tests/test_deepspeed_training_smoke.py 
   --results bench/results.jsonl
 ```
 
-Card targets:
+卡目标:
 
-| Priority | Card family | Goal |
+| 优先级 | 卡族 | 目标 |
 |---|---|---|
-| P0 | V100 1x/2x | Keep baseline green; add ZeRO resume and large-model smoke. |
-| P0 | A100 | Add Ampere production throughput, bf16, quant, ZeRO rows. |
-| P0 | RTX 4090 | Add common consumer Ada evidence. |
-| P1 | H100 | Add Hopper high-end throughput and bf16/quant rows. |
-| P1 | RTX 5090 / 50-series | Add Blackwell consumer validation and regression rows. |
-| P1 | Pascal/Turing | Verify fallback behavior and older-card constraints. |
-| P2 | AMD ROCm | Start native/no-FLA compatibility and document gaps. |
-| P2 | CPU | Keep tiny native/no-FLA import and API tests working. |
+| P0 | V100 1×/2× | 保持基线绿灯;补 ZeRO resume 与大模型 smoke。 |
+| P0 | A100 | 补 Ampere 生产吞吐、bf16、量化、ZeRO 行。 |
+| P0 | RTX 4090 | **进行中** —— 补常见消费级 Ada 证据。 |
+| P1 | H100 | 补 Hopper 高端吞吐与 bf16 / 量化行。 |
+| P1 | RTX 5090 / 50 系 | 补 Blackwell 消费级验证与回归行。 |
+| P1 | Pascal / Turing | 验证 fallback 行为与老卡约束。 |
+| P2 | AMD ROCm | 先做 native / 无 FLA 兼容并记录缺口。 |
+| P2 | CPU | 保持 tiny native / 无 FLA import 与 API 测试可用。 |
 
-## P1: productionize the HF user experience
+## P1:生产化 HF 体验
 
 ### 5. Accelerate / `device_map` / offload
 
-Needed work:
-
 - `device_map="auto"` smoke;
-- manual multi-GPU layer placement smoke on larger models;
+- 大模型手动多卡分层 placement smoke;
 - CPU offload smoke;
-- clear docs for when fast-token shortcuts are disabled by sharding;
-- examples for single-GPU, multi-GPU, and offload loading.
+- 明确文档:分片时 fast-token shortcut 何时被禁用;
+- 单卡 / 多卡 / offload 加载示例。
 
-### 6. PEFT / QLoRA matrix
+### 6. PEFT / QLoRA 矩阵
 
-Needed work:
+- 记录推荐 LoRA target module;
+- 验证 adapter merge 后 `generate()`;
+- 卡支持时补 QLoRA 8/4-bit 训练 smoke;
+- 记录 QLoRA 加载的显存差。
 
-- document recommended LoRA target modules;
-- verify adapter merge then `generate()`;
-- add QLoRA 8-bit and 4-bit training smoke where bitsandbytes supports the card;
-- record memory deltas for QLoRA loads.
+### 7. TRL 训练加固
 
-### 7. TRL training hardening
+- 更长的 SFT/DPO/GRPO smoke;
+- 每种 trainer 的 checkpoint save/load;
+- 更清晰地处理 fp16/bf16/fp32 训练 dtype 行为;
+- 小型公开 toy 数据集示例。
 
-Needed work:
+### 8. Hub 与示例
 
-- longer SFT/DPO/GRPO smoke runs;
-- checkpoint save/load for each trainer type;
-- clearer handling of fp16/bf16/fp32 training dtype behavior;
-- small public toy dataset examples.
+- 最小推理示例;
+- 最小 LoRA 示例;
+- 最小 SFT 示例;
+- 最小 DPO/GRPO 示例;
+- model-card 说明:RWKV recurrent state cache 与 Transformer KV cache 的区别;
+- `trust_remote_code=True` 加载说明与依赖。
 
-### 8. Hub and examples
+### 9. CI 与打包
 
-Needed work:
+- 无 CUDA import 测试;
+- CPU tiny-model API 测试;
+- 转换 / 配置测试;
+- 可选 GPU smoke benchmark workflow;
+- training / 量化 / dev docs 的 dependency extras。
 
-- minimal inference example;
-- minimal LoRA example;
-- minimal SFT example;
-- minimal DPO/GRPO examples;
-- model-card notes explaining RWKV recurrent state cache vs Transformer KV cache;
-- `trust_remote_code=True` loading notes and expected dependencies.
+## P2:闭合性能与量化缺口
 
-### 9. CI and packaging
+> 路线与数字权威见 [`FUSED_BACKEND.md`](FUSED_BACKEND.md) 与 [`BENCHMARK.md`](BENCHMARK.md);本节只列实操动作。
 
-Needed work:
+### 10. Albatross / RWKV-LM 速度缺口
 
-- no-CUDA import test;
-- CPU tiny-model API tests;
-- conversion/config tests;
-- optional GPU workflow for smoke benchmarks;
-- dependency extras for training/quantization/dev docs.
+继续走 fast-token / native-graph 路线,而非堆 wrapper 层。当前路线:`native_graph → fused fp16 kernel → fused W8/W4 kernel`(详见 FUSED_BACKEND)。需补:
 
-## P2: close performance and quantization gaps
+- 同卡同 checkpoint 的 prefill / decode / batch-size sweep;
+- latency 与峰值显存行;
+- cache 命中率行;
+- `bench/analyze_results.py` / `bench/check_results.py` 里的明确 ratio gate。
 
-### 10. Albatross / RWKV-LM speed gap
+### 11. 量化速度
 
-Performance work should continue on the fast-token/native-graph route instead of
-adding wrapper layers.
+现状:W8/W4 加载与显存下降可用,速度未达生产级(详见 BENCHMARK 量化段 + FUSED_BACKEND quant target)。需补:
 
-Current intended route:
+- native packed W8/W4 权重布局;
+- fused dequant + projection 路径;
+- V100 / A100 / 4090 / H100 / 50 系卡专项调优;
+- 接近 llama.cpp Q*_K_M 实用量级的质量 telemetry;
+- 速度目标:W8/W4 在常见卡上不慢于 fp16。
 
-```text
-native_graph -> fused fp16 kernel -> fused W8/W4 kernel
-```
+### 12. 训练吞吐
 
-Needed proof:
+- 尽可能对标 HF Trainer / PEFT 吞吐与 RWKV-LM 训练;
+- batch-size 与序列长度 sweep;
+- activation / checkpointing 显存行;
+- ZeRO-2/3 吞吐与显存行。
 
-- prefill/decode/batch-size sweeps against the same checkpoint and same card;
-- latency and peak-memory rows;
-- cache hit-rate rows;
-- clear ratio gates in `bench/analyze_results.py` / `bench/check_results.py`.
+## P3:upstream 与长期兼容
 
-### 11. Quantized speed
+### 13. Native Transformers 方向
 
-Current status: W8/W4 loading and memory reduction work, but speed is not yet
-production-complete.
-
-Needed work:
-
-- native packed W8/W4 weight layout;
-- fused dequant + projection path;
-- card-specific tuning for V100/A100/4090/H100/50-series;
-- quality telemetry close to llama.cpp-style practical quantization levels;
-- speed target: W8/W4 should be no slower than fp16 on common cards.
-
-### 12. Training throughput
-
-Needed work:
-
-- compare HF Trainer/PEFT throughput with RWKV-LM training where possible;
-- batch-size and sequence-length sweeps;
-- activation/checkpointing memory rows;
-- ZeRO-2/3 throughput and memory rows.
-
-## P3: upstream and long-term compatibility
-
-### 13. Native Transformers direction
-
-Long-term upstream shape:
+长期 upstream 形态(详见 [`HF_CRITERIA.md`](HF_CRITERIA.md) §3 缺口 5):
 
 ```text
 src/transformers/models/rwkv7/
@@ -241,37 +205,35 @@ src/transformers/models/rwkv7/
   convert_rwkv7_original_to_hf.py
 ```
 
-Needed work:
+需补:
 
-- pure PyTorch/reference path without mandatory FLA;
-- optional CUDA/Triton kernels;
-- CPU and AMD compatibility story;
+- 不强依赖 FLA 的 pure PyTorch / reference 路径;
+- 可选 CUDA / Triton kernel;
+- CPU 与 AMD 兼容方案;
 - Transformers model common tests;
-- generation tests;
-- tokenizer/model-card docs.
+- generation 测试;
+- tokenizer / model-card 文档。
 
-### 14. HF-compatible speculative decoding
+### 14. HF 兼容 speculative decoding
 
-Needed work:
-
-- more draft/target size pairs;
-- longer prompts and larger batches;
+- 更多 draft / target 尺寸组合;
+- 更长 prompt 与更大 batch;
 - acceptance-rate telemetry;
-- correctness checks against target greedy output;
-- documentation for when speculative decoding helps or hurts.
+- 对 target greedy 的正确性校验;
+- 文档:speculative decoding 何时有益 / 有害。
 
-## PR checklist for contributors
+## 贡献者 PR checklist
 
-Before opening a PR, include:
+开 PR 前包含:
 
-- [ ] What was changed and why.
-- [ ] Exact command(s) run.
-- [ ] Hardware and software versions for GPU work.
-- [ ] Result rows or benchmark summary if applicable.
-- [ ] Updated docs if behavior, support matrix, or TODO status changed.
-- [ ] Confirmation that the change is HF-adapter scoped.
+- [ ] 改了什么、为什么。
+- [ ] 确切命令。
+- [ ] GPU 工作的软硬件版本。
+- [ ] 结果行或 benchmark 摘要(适用时)。
+- [ ] 行为 / 支持矩阵 / TODO 状态变化时同步更新文档。
+- [ ] 确认改动是 HF 适配范围。
 
-For documentation-only PRs, at minimum run:
+纯文档 PR 至少跑:
 
 ```bash
 git diff --check
