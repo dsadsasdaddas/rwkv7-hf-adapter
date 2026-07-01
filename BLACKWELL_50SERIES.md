@@ -96,3 +96,6 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 
 ### 2026-07-01 — main PR#28 native training unit test 在 5070 ✅
 main 的 `tests/test_native_model_training_unit.py`(团队 PR#28 加的 native CausalLM 训练 loss + 单元测试)在 5070 直接 **PASS**。即 **main 自带的 native 训练测试在 Blackwell 上绿**——不只我的 `test_native_training_smoke.py`,main 的官方测试也覆盖了 Blackwell native 训练路径。
+
+### 2026-07-01 — sm_120 训练 blocker 范围:所有 FLA backward(不只 RL)
+复查 `test_hf_training_smoke`(普通 SFT Trainer,fused_recurrent)**也炸**——同一 `OutOfResources: shared memory 131072 > 101376`。所以 sm_120 训练 blocker **不只影响 RL,而是所有 FLA backward**(SFT + DPO + GRPO)。**Blackwell 上所有 FLA 训练都可能撞 shared-mem**;native(纯 PyTorch)是通用训练路径。triton autotuner 的 num_stages/BT 选择决定是否触发(有概率性),native 路径确定性可用。
