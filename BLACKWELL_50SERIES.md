@@ -78,3 +78,12 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 ### 训练
 - FLA backward: ❌(kernel 128KB > 99KB shared mem)
 - Native backward: ✅(workaround,纯 PyTorch)
+
+### 2026-07-01 — ✅ 50 系训练 workaround 落地:NativeRWKV7 SFT 可训练
+给 `native_model.py` 加了序列级 loss 支持(`_run(collect_all=True)` 累积每 token logits + forward 接 `labels` 算 cross_entropy)+ `get_input/output_embeddings`(peft 需要)。
+
+**验证(0.1B,5070,LoRA-like:只解冻 r_proj)**:
+- fp32 SFT 5 步 loss: **[2.12, 1.57, 0.72, 0.34, 0.38]** —— **loss 稳定下降,backward 干净,无 shared-mem 限制**。
+- fp16 SFT 第 2 步溢出 nan(fp16 grad overflow,非 shared-mem;需 fp32/bf16/grad-scaling)。
+
+**结论**:Blackwell 训练 backward 的 sm_120 硬阻塞(FLA kernel 超 99KB)**有解**——用 NativeRWKV7ForCausalLM(纯 PyTorch,无 fla kernel)做训练,序列级 SFT 正常。FLA wrapper 推理可用、训练 backward 阻塞;**native 模型推理+训练在 Blackwell 都通**。
