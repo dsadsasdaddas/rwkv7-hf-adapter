@@ -26,3 +26,12 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 **根因**:FLA 的 RWKV7 反向 kernel(DPLR chunk_A_bwd)需 **128KB 共享内存,5070(sm_120)硬件上限 ~99KB(101376)** → 训练 backward 在 Blackwell 上无法运行。chunk / fused_recurrent 共用同一反向 kernel,换 attn-mode 无效。
 **影响**:Blackwell 上 **推理 ✅(native/quant/spec 都过),训练 backward ❌**。PEFT LoRA forward/backward(之前 test_peft_lora)用的是 fused_recurrent 小批量,可能没触发;RL(DPO/GRPO)的 backward 触发了大 chunk 反向 → 炸。
 **修复方向**:① 减 fla kernel 的 block size / num_stages(让它 < 99KB);② upstream fla 为 sm_120 调小 kernel 配置;③ 或训练在 V100/A100(更大 shared memory)上跑,Blackwell 仅做推理验证。
+
+### 2026-07-01 — ✅ 50 系训练 workaround:用 native 模型做 backward
+根因确认:`fla.utils._device.check_shared_mem()` 对 5070 已返回 **False**(max shared mem 101376 < 阈值 102400),所以 BK 已减到 32——但 fla DPLR backward kernel **仍需 131072 字节 > 5070 上限 101376**。即 **fla 的"小 shared-mem 路径"对 5070(99KB)还不够小,是 upstream fla 问题**(需更小 BT/num_stages)。
+
+**Workaround(50 系可用)**:用 **`NativeRWKV7ForCausalLM`(纯 PyTorch,无 fla kernel)**做训练 backward。验证:0.1B fp16,LoRA-style 冻结除 r_proj+lm_head,末位 logit loss=10.9,**backward 成功,2 个非零梯度**。native 走 autograd,不碰 triton kernel → 无 shared mem 限制。
+
+**结论(Blackwell 训练)**:
+- FLA wrapper 训练 backward ❌(fla kernel 超 99KB,upstream fla 须修)。
+- **Native 模型训练 backward ✅(50 系用 native 做训练)**。
