@@ -26,6 +26,24 @@ from transformers import AutoTokenizer
 
 from rwkv7_hf.native_model import NativeRWKV7ForCausalLM
 
+try:  # Keep this smoke independent of a partially-installed DeepSpeed package.
+    import accelerate.utils.other as _accelerate_other
+
+    _accelerate_other.is_deepspeed_available = lambda: False
+except Exception:
+    pass
+
+try:  # TRL versions may import the newer torch FSDPModule symbol on older torch.
+    import torch.distributed.fsdp as _torch_fsdp
+
+    if not hasattr(_torch_fsdp, "FSDPModule"):
+        class _RWKV7FSDPModuleCompat(torch.nn.Module):
+            pass
+
+        _torch_fsdp.FSDPModule = _RWKV7FSDPModuleCompat
+except Exception:
+    pass
+
 PROMPTS = ["The quick brown fox", "Once upon a time"]
 
 

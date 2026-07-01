@@ -24,6 +24,13 @@ from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 from rwkv7_hf.native_model import NativeRWKV7ForCausalLM
 
+try:  # Keep this smoke independent of a partially-installed DeepSpeed package.
+    import accelerate.utils.other as _accelerate_other
+
+    _accelerate_other.is_deepspeed_available = lambda: False
+except Exception:
+    pass
+
 PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
     "Once upon a time, in a faraway land,",

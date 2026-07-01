@@ -36,8 +36,11 @@ except Exception:  # pragma: no cover - optional native acceleration
 try:  # pragma: no cover - optional Cache base for HF GenerationMixin/Trainer compat
     from fla.models.utils import Cache as _FLACache
 except Exception:  # pragma: no cover
-    class _FLACache:  # minimal fallback so native_model imports without fla
-        pass
+    try:
+        from transformers.cache_utils import Cache as _FLACache
+    except Exception:
+        class _FLACache:  # minimal fallback so native_model imports without fla or transformers
+            pass
 
 
 class NativeRWKV7Cache(_FLACache):
@@ -80,6 +83,8 @@ class NativeRWKV7Cache(_FLACache):
 
     @classmethod
     def from_legacy_cache(cls, legacy, seen_tokens: int = 0):
+        if legacy is None:
+            return cls(seen_tokens=seen_tokens)
         if isinstance(legacy, NativeRWKV7Cache):
             return legacy
         state, xpa, xpf, v_first = legacy

@@ -12,11 +12,40 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from fla.models.rwkv7.modeling_rwkv7 import RWKV7Model as _RWKV7Model
-from fla.models.rwkv7.modeling_rwkv7 import RWKV7ForCausalLM as _RWKV7ForCausalLM
-from fla.models.utils import Cache as _FLACache
-from fla.ops.rwkv7.fused_recurrent import fused_mul_recurrent_rwkv7
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+_FLA_IMPORT_ERROR: Exception | None = None
+
+try:
+    from fla.models.rwkv7.modeling_rwkv7 import RWKV7Model as _RWKV7Model
+    from fla.models.rwkv7.modeling_rwkv7 import RWKV7ForCausalLM as _RWKV7ForCausalLM
+    from fla.models.utils import Cache as _FLACache
+    from fla.ops.rwkv7.fused_recurrent import fused_mul_recurrent_rwkv7
+except Exception as exc:  # pragma: no cover - exercised by fla-free native backend tests
+    _FLA_IMPORT_ERROR = exc
+    from transformers.cache_utils import Cache as _FLACache
+    from transformers.modeling_utils import PreTrainedModel
+
+    class _MissingFLABase(PreTrainedModel):
+        """Fallback base that keeps remote-code import alive without FLA."""
+
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "flash-linear-attention (`fla`) is required for the optimized "
+                "RWKV7ForCausalLM wrapper. Set RWKV7_NATIVE_MODEL=1 to load the "
+                "fla-free NativeRWKV7ForCausalLM backend instead."
+            ) from _FLA_IMPORT_ERROR
+
+    class _RWKV7Model(_MissingFLABase):
+        pass
+
+    class _RWKV7ForCausalLM(_MissingFLABase):
+        pass
+
+    def fused_mul_recurrent_rwkv7(*args, **kwargs):
+        raise ImportError(
+            "flash-linear-attention (`fla`) is required for fused RWKV-7 recurrent ops."
+        ) from _FLA_IMPORT_ERROR
 
 try:
     from .configuration_rwkv7 import RWKV7Config
