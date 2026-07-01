@@ -149,7 +149,7 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
         """Lazy-cache the JIT weight packs for fast decode (gate H2)."""
         packs = getattr(self, "_nj_packs", None)
         if packs is None and _HAS_NATIVE_JIT:
-            packs = _nj_extract(self)
+            packs = _nj_extract(self)[0]  # extract() returns (packs, H, N, eps)
             self._nj_packs = packs
         return packs
 
@@ -164,35 +164,42 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
         logits = F.linear(x, self.lm_head.weight).view(1, 1, -1)
         return logits, state, xpa, xpf, v_first
 
-    def forward(self, input_ids, past_key_values=None, use_cache=False, **kwargs):
+    def forward(self, input_ids, past_key_values=None, use_cache=False, _native_gen=False, **kwargs):
         base = self.model
-        device, dtype = input_ids.device, base.embeddings.weight.dtype
-        if past_key_values is None:
-            state, xpa, xpf, v_first = _init_state(self, device, dtype)
-            logits, state, xpa, xpf, v_first = self._run(
-                input_ids[0], state, xpa, xpf, v_first, device, dtype)
+        if not _native_gen:
+            # Stateless standalone forward: each call independent (full prefill).
+            logits, *_ = self._run(input_ids[0], *_init_state(
+                self, input_ids.device, base.embeddings.weight.dtype),
+                input_ids.device, base.embeddings.weight.dtype)
+            return CausalLMOutputWithPast(logits=logits)
+        # Generate path: thread the recurrent state internally, processing only
+        # new tokens (sidesteps the HF Cache contract, gate H2). Reset when the
+        # input does not extend the current run.
+        sl = int(input_ids.shape[1])
+        gen = getattr(self, "_gen", None)
+        gl = getattr(self, "_gen_len", 0)
+        if gen is None or sl <= gl:
+            state, xpa, xpf, v_first = _init_state(self, input_ids.device, base.embeddings.weight.dtype)
+            gl = 0
         else:
-            state, xpa, xpf, v_first = past_key_values
-            x = F.embedding(input_ids[0, -1:], base.embeddings.weight).reshape(-1)
-            packs = self._get_packs()
-            if packs is not None:
-                # Fast decode: JIT-fused block_step (gate H2).
-                x, state, xpa, xpf, v_first = _nj_step(
-                    self, x, state, xpa, xpf, v_first, packs)
-            else:
-                x, state, xpa, xpf, v_first = _step_token(
-                    self, x, state, xpa, xpf, v_first)
-            x = base.norm(x)
-            logits = F.linear(x, self.lm_head.weight).view(1, 1, -1)
-        new_cache = (state, xpa, xpf, v_first) if use_cache else None
-        return CausalLMOutputWithPast(logits=logits, past_key_values=new_cache)
+            state, xpa, xpf, v_first = gen
+        new_toks = input_ids[0, gl:sl]
+        packs = self._get_packs()
+        if new_toks.shape[0] == 1 and gl > 0 and packs is not None:
+            x = F.embedding(new_toks, base.embeddings.weight).reshape(-1)
+            x, state, xpa, xpf, v_first = _nj_step(self, x, state, xpa, xpf, v_first, packs)
+        else:
+            x = None
+            for t in range(new_toks.shape[0]):
+                x = F.embedding(new_toks[t:t + 1], base.embeddings.weight).reshape(-1)
+                x, state, xpa, xpf, v_first = _step_token(self, x, state, xpa, xpf, v_first)
+        self._gen = (state, xpa, xpf, v_first)
+        self._gen_len = sl
+        x = base.norm(x)
+        logits = F.linear(x, self.lm_head.weight).view(1, 1, -1)
+        return CausalLMOutputWithPast(logits=logits)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-        # NOTE: a proper recurrent Cache (so HF generate threads state and the
-        # JIT decode path is used) is gate H2 — for now generate re-prefills the
-        # prompt each step (correct but O(n^2)-slow). Fast generate needs a
-        # Cache wrapper like RWKV7StateCache.
-        return {"input_ids": input_ids, "past_key_values": past_key_values,
-                "use_cache": past_key_values is not None}
+        # The _native_gen flag routes generate steps through the internal-state
+        # fast path; standalone forward() stays stateless.
+        return {"input_ids": input_ids, "_native_gen": True}
