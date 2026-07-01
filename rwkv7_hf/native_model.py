@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
@@ -117,7 +118,7 @@ class NativeRWKV7Model(PreTrainedModel):
         self.norm = nn.LayerNorm(config.hidden_size)
 
 
-class NativeRWKV7ForCausalLM(PreTrainedModel):
+class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = NativeRWKV7Config
     base_model_prefix = "model"
     _no_split_modules = ["NativeRWKV7Layer"]
@@ -133,14 +134,33 @@ class NativeRWKV7ForCausalLM(PreTrainedModel):
         self.model = NativeRWKV7Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, input_ids, **kwargs):
+    def _run(self, token_ids, state, xpa, xpf, v_first, device, dtype):
+        """Sequentially advance over token_ids [T] (T>=1), threading state."""
         base = self.model
-        state, xpa, xpf, v_first = _init_state(
-            self, input_ids.device, base.embeddings.weight.dtype)
         x = None
-        for t in range(input_ids.shape[1]):
-            x = F.embedding(input_ids[0, t:t + 1], base.embeddings.weight).reshape(-1)
+        for t in range(token_ids.shape[0]):
+            x = F.embedding(token_ids[t:t + 1], base.embeddings.weight).reshape(-1)
             x, state, xpa, xpf, v_first = _step_token(self, x, state, xpa, xpf, v_first)
         x = base.norm(x)
         logits = F.linear(x, self.lm_head.weight).view(1, 1, -1)
-        return CausalLMOutputWithPast(logits=logits)
+        return logits, state, xpa, xpf, v_first
+
+    def forward(self, input_ids, past_key_values=None, use_cache=False, **kwargs):
+        base = self.model
+        device, dtype = input_ids.device, base.embeddings.weight.dtype
+        if past_key_values is None:
+            state, xpa, xpf, v_first = _init_state(self, device, dtype)
+            toks = input_ids[0]
+        else:
+            state, xpa, xpf, v_first = past_key_values
+            toks = input_ids[0, -1:]  # single new token in incremental decode
+        logits, state, xpa, xpf, v_first = self._run(
+            toks, state, xpa, xpf, v_first, device, dtype)
+        new_cache = (state, xpa, xpf, v_first) if use_cache else None
+        return CausalLMOutputWithPast(logits=logits, past_key_values=new_cache)
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        return {"input_ids": input_ids, "past_key_values": past_key_values,
+                "use_cache": past_key_values is not None}
