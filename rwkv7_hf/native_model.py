@@ -313,6 +313,11 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
             raise ValueError("Experimental NativeRWKV7ForCausalLM expects input_ids shaped [batch, seq]")
         if int(input_ids.shape[0]) <= 0 or int(input_ids.shape[1]) <= 0:
             raise ValueError("NativeRWKV7ForCausalLM requires a non-empty batch and sequence")
+        if return_dict is None:
+            # HF/PEFT/TRL forward `return_dict=None`; treat as the True default
+            # (without this, `if not return_dict:` sent None down the tuple path
+            # and DPOTrainer's `outputs.logits` failed with AttributeError).
+            return_dict = True
         base = self.model
         device, dtype = input_ids.device, base.embeddings.weight.dtype
         if labels is not None:
@@ -347,12 +352,16 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
             toks = input_ids
             use_jit = False
             seen = int(toks.shape[1])
+            collect_all = True  # full forward -> all-token logits [B, seq, vocab] (HF CausalLM semantics; DPO/eval need per-token logprobs)
         else:
             state, xpa, xpf, v_first = past_key_values
             toks = input_ids[:, -1:]
             use_jit = True
             seen = _cache_seen(past_key_values) + int(toks.shape[1])
-        logits, state, xpa, xpf, v_first = self._run(toks, state, xpa, xpf, v_first, use_jit=use_jit)
+            collect_all = False  # decode -> last-token logits only (fast path)
+        logits, state, xpa, xpf, v_first = self._run(
+            toks, state, xpa, xpf, v_first, use_jit=use_jit, collect_all=collect_all
+        )
         new_cache = NativeRWKV7Cache(state, xpa, xpf, v_first, seen_tokens=seen) if use_cache else None
         if not return_dict:
             return (logits, new_cache) if use_cache else (logits,)
