@@ -93,3 +93,6 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 1. `gradient_checkpointing` 默认开 → native 不支持(关掉可绕过)。
 2. 关掉后 Trainer `compute_loss` 调到 `_forward_unimplemented`(默认 PreTrainedModel.forward),没路由到 NativeRWKV7ForCausalLM.forward——是 Trainer 包装层与 native 模型的路由问题,需调试(可能 SFTTrainer 对模型 forward 签名/包装有假设)。
 **结论**:Blackwell **native 训练能力已证(手动 + 测试)**;TRL SFTTrainer 生产包装的适配是**后续 polish**(非 sm_120 阻塞,是 Trainer 集成)。FLA wrapper 的 SFTTrainer 在 V100 工作(main 已覆盖),Blackwell 用 native 时走手动/trainer-adapted 路径。
+
+### 2026-07-01 — main PR#28 native training unit test 在 5070 ✅
+main 的 `tests/test_native_model_training_unit.py`(团队 PR#28 加的 native CausalLM 训练 loss + 单元测试)在 5070 直接 **PASS**。即 **main 自带的 native 训练测试在 Blackwell 上绿**——不只我的 `test_native_training_smoke.py`,main 的官方测试也覆盖了 Blackwell native 训练路径。
