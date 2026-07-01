@@ -165,6 +165,9 @@ def main() -> int:
     packs = [(0, 12, 64)]
     old_limit = os.environ.get("RWKV7_NATIVE_GRAPH_CACHE_SIZE")
     old_recurrent_output = os.environ.get("RWKV7_NATIVE_GRAPH_FUSED_RECURRENT_OUTPUT")
+    old_lora_policy = os.environ.get("RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY")
+    old_lora_min_hidden = os.environ.get("RWKV7_NATIVE_GRAPH_VKWR_LORA_MIN_HIDDEN")
+    old_lora_max_rows = os.environ.get("RWKV7_NATIVE_GRAPH_VKWR_LORA_MAX_ROWS")
     os.environ["RWKV7_NATIVE_GRAPH_CACHE_SIZE"] = "2"
     try:
         os.environ.pop("RWKV7_NATIVE_GRAPH_FUSED_RECURRENT_OUTPUT", None)
@@ -173,6 +176,15 @@ def main() -> int:
         assert modeling._native_graph_fused_recurrent_output_requested() is False
         os.environ["RWKV7_NATIVE_GRAPH_FUSED_RECURRENT_OUTPUT"] = "1"
         assert modeling._native_graph_fused_recurrent_output_requested() is True
+        os.environ.pop("RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY", None)
+        assert modeling._native_graph_fused_lora_policy() == "manual"
+        os.environ["RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY"] = "vkwr"
+        assert modeling._native_graph_fused_lora_policy() == "vkwr_auto"
+        os.environ["RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY"] = "off"
+        assert modeling._native_graph_fused_lora_policy() == "off"
+        os.environ["RWKV7_NATIVE_GRAPH_VKWR_LORA_MIN_HIDDEN"] = "bad"
+        os.environ["RWKV7_NATIVE_GRAPH_VKWR_LORA_MAX_ROWS"] = "999"
+        assert modeling._native_graph_vkwr_lora_thresholds() == (1024, 64)
 
         get_runner = modeling.RWKV7ForCausalLM._rwkv7_native_graph_runner
         clear_cache = modeling.RWKV7ForCausalLM.rwkv7_clear_native_graph_cache
@@ -227,6 +239,18 @@ def main() -> int:
             os.environ.pop("RWKV7_NATIVE_GRAPH_FUSED_RECURRENT_OUTPUT", None)
         else:
             os.environ["RWKV7_NATIVE_GRAPH_FUSED_RECURRENT_OUTPUT"] = old_recurrent_output
+        if old_lora_policy is None:
+            os.environ.pop("RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY", None)
+        else:
+            os.environ["RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY"] = old_lora_policy
+        if old_lora_min_hidden is None:
+            os.environ.pop("RWKV7_NATIVE_GRAPH_VKWR_LORA_MIN_HIDDEN", None)
+        else:
+            os.environ["RWKV7_NATIVE_GRAPH_VKWR_LORA_MIN_HIDDEN"] = old_lora_min_hidden
+        if old_lora_max_rows is None:
+            os.environ.pop("RWKV7_NATIVE_GRAPH_VKWR_LORA_MAX_ROWS", None)
+        else:
+            os.environ["RWKV7_NATIVE_GRAPH_VKWR_LORA_MAX_ROWS"] = old_lora_max_rows
 
     old_backend = os.environ.get("RWKV7_FAST_TOKEN_BACKEND")
     old_fast_forward = os.environ.get("RWKV7_FAST_FORWARD")

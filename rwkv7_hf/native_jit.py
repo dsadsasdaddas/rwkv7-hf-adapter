@@ -184,6 +184,73 @@ def _native_graph_fused_wavg_lora_enabled() -> bool:
         return False
 
 
+def _native_graph_fused_lora_policy() -> str:
+    """Return the optional VKWR-inspired fused-LoRA dispatch policy.
+
+    ``manual`` keeps the historical behavior: WAG/WAVG LoRA kernels are used
+    only when their explicit env flags are enabled. ``vkwr_auto`` borrows the
+    VKWR low-rank dispatch idea and only routes tiny decode batches through the
+    grouped W/A/G(/V) LoRA kernels when hidden size and row count are in the
+    range where a custom low-rank kernel can plausibly beat generic launches.
+    """
+
+    raw = os.environ.get("RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY", "manual").strip().lower()
+    if raw in {"", "manual", "explicit", "env"}:
+        return "manual"
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return "off"
+    if raw in {"vkwr", "vkwr_auto", "auto", "dispatch"}:
+        return "vkwr_auto"
+    return "manual"
+
+
+def _native_graph_int_env(name: str, default: int, *, lo: int = 1, hi: int | None = None) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+
+def _native_graph_vkwr_lora_dispatch(rows: int, hidden_size: int, layer_idx: int, *, include_v_gate: bool) -> bool:
+    """VKWR-style low-rank fused-kernel gate for native_graph decode.
+
+    VKWR's low-rank dispatcher uses fused rank kernels only for small row
+    counts and sufficiently large hidden sizes.  Our Triton probes showed the
+    same lesson: isolated WAG/WAVG speedups do not automatically translate to
+    end-to-end gains, especially on the 0.1B hidden=768 model.  Keep this
+    policy opt-in while we validate larger checkpoints.
+    """
+
+    if _native_graph_fused_lora_policy() != "vkwr_auto":
+        return False
+    if rows <= 0 or hidden_size <= 0:
+        return False
+    min_hidden = _native_graph_int_env("RWKV7_NATIVE_GRAPH_VKWR_LORA_MIN_HIDDEN", 1024, lo=1)
+    max_rows = _native_graph_int_env("RWKV7_NATIVE_GRAPH_VKWR_LORA_MAX_ROWS", 4, lo=1, hi=64)
+    if hidden_size < min_hidden or rows > max_rows:
+        return False
+    if include_v_gate and layer_idx == 0:
+        return False
+    if include_v_gate:
+        if fused_wavg_lora is None or fused_wavg_lora_available is None:
+            return False
+        try:
+            return bool(fused_wavg_lora_available())
+        except Exception:
+            return False
+    if fused_wag_lora is None or fused_wag_lora_available is None:
+        return False
+    try:
+        return bool(fused_wag_lora_available())
+    except Exception:
+        return False
+
+
 def _native_graph_fused_wag_lora_blocks() -> tuple[int, int, int]:
     """Return ``(block_m, block_r, block_k)`` for the W/A/G LoRA probe."""
 
@@ -535,6 +602,8 @@ def _block_ip(x, state, xpa, xpf, v_first, p):
     xr = h + xx * x_r; xw = h + xx * x_w; xk = h + xx * x_k
     xv = h + xx * x_v; xa = h + xx * x_a; xg = h + xx * x_g
     v_gate = None
+    use_wavg_lora = _native_graph_fused_wavg_lora_enabled() or _native_graph_vkwr_lora_dispatch(1, H * N, i, include_v_gate=True)
+    use_wag_lora = _native_graph_fused_wag_lora_enabled() or _native_graph_vkwr_lora_dispatch(1, H * N, i, include_v_gate=False)
     if _native_graph_fused_projection_enabled():
         r, k, v, w, a, g = fused_rkv_wag_projection(
             xr.view(1, H * N),
@@ -562,7 +631,7 @@ def _block_ip(x, state, xpa, xpf, v_first, p):
         w = w.view(H * N)
         a = torch.sigmoid(a.view(H * N))
         g = g.view(H * N)
-    elif _native_graph_fused_wavg_lora_enabled():
+    elif use_wavg_lora:
         r = F.linear(xr, Rw)
         k = F.linear(xk, Kw)
         v = F.linear(xv, Vw)
@@ -598,7 +667,7 @@ def _block_ip(x, state, xpa, xpf, v_first, p):
             g = g.view(H * N)
             v_gate = v_gate.view(H * N)
         a = torch.sigmoid(a)
-    elif _native_graph_fused_wag_lora_enabled():
+    elif use_wag_lora:
         r = F.linear(xr, Rw)
         k = F.linear(xk, Kw)
         v = F.linear(xv, Vw)
@@ -734,6 +803,8 @@ def _block_ip_batched(x, state, xpa, xpf, v_first, p):
     xr = h + xx * x_r; xw = h + xx * x_w; xk = h + xx * x_k
     xv = h + xx * x_v; xa = h + xx * x_a; xg = h + xx * x_g
     v_gate = None
+    use_wavg_lora = _native_graph_fused_wavg_lora_enabled() or _native_graph_vkwr_lora_dispatch(B, H * N, i, include_v_gate=True)
+    use_wag_lora = _native_graph_fused_wag_lora_enabled() or _native_graph_vkwr_lora_dispatch(B, H * N, i, include_v_gate=False)
     if _native_graph_fused_projection_enabled():
         r, k, v, w, a, g = fused_rkv_wag_projection(
             xr,
@@ -756,7 +827,7 @@ def _block_ip_batched(x, state, xpa, xpf, v_first, p):
             None,
         )
         a = torch.sigmoid(a)
-    elif _native_graph_fused_wavg_lora_enabled():
+    elif use_wavg_lora:
         r = F.linear(xr, Rw)
         k = F.linear(xk, Kw)
         v = F.linear(xv, Vw)
@@ -788,7 +859,7 @@ def _block_ip_batched(x, state, xpa, xpf, v_first, p):
                 block_k=block_k,
             )
         a = torch.sigmoid(a)
-    elif _native_graph_fused_wag_lora_enabled():
+    elif use_wag_lora:
         r = F.linear(xr, Rw)
         k = F.linear(xk, Kw)
         v = F.linear(xv, Vw)

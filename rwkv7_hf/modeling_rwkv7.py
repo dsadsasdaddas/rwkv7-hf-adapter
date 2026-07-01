@@ -161,6 +161,39 @@ def _native_graph_fused_wavg_lora_requested() -> bool:
     return os.environ.get("RWKV7_NATIVE_GRAPH_FUSED_WAVG_LORA", "0") not in _FALSE_VALUES
 
 
+def _native_graph_fused_lora_policy() -> str:
+    """Cache-key visible policy for VKWR-inspired fused LoRA dispatch."""
+
+    raw = os.environ.get("RWKV7_NATIVE_GRAPH_FUSED_LORA_POLICY", "manual").strip().lower()
+    if raw in {"", "manual", "explicit", "env"}:
+        return "manual"
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return "off"
+    if raw in {"vkwr", "vkwr_auto", "auto", "dispatch"}:
+        return "vkwr_auto"
+    return "manual"
+
+
+def _native_graph_vkwr_lora_thresholds() -> tuple[int, int]:
+    """Return ``(min_hidden, max_rows)`` used by the opt-in VKWR policy."""
+
+    vals = []
+    for name, default, lower, upper in (
+        ("RWKV7_NATIVE_GRAPH_VKWR_LORA_MIN_HIDDEN", 1024, 1, None),
+        ("RWKV7_NATIVE_GRAPH_VKWR_LORA_MAX_ROWS", 4, 1, 64),
+    ):
+        raw = os.environ.get(name, str(default)).strip()
+        try:
+            val = int(raw)
+        except ValueError:
+            val = default
+        val = max(lower, val)
+        if upper is not None:
+            val = min(upper, val)
+        vals.append(val)
+    return vals[0], vals[1]
+
+
 def _native_graph_fused_wag_lora_blocks() -> tuple[int, int, int]:
     vals = []
     for name, default, upper in (
@@ -1182,6 +1215,8 @@ class RWKV7ForCausalLM(_RWKV7ForCausalLM):
             _native_graph_fused_wag_lora_blocks(),
             _native_graph_fused_wavg_lora_requested(),
             _native_graph_fused_wavg_lora_blocks(),
+            _native_graph_fused_lora_policy(),
+            _native_graph_vkwr_lora_thresholds(),
             int(batch_size),
         )
         cache = getattr(self, "_rwkv7_native_graph_runner_cache", None)
