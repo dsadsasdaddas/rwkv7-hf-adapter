@@ -87,3 +87,9 @@ fla/ops/generalized_delta_rule/dplr/chunk_A_bwd.py:499 chunk_dplr_bwd_dqk_intra
 - fp16 SFT 第 2 步溢出 nan(fp16 grad overflow,非 shared-mem;需 fp32/bf16/grad-scaling)。
 
 **结论**:Blackwell 训练 backward 的 sm_120 硬阻塞(FLA kernel 超 99KB)**有解**——用 NativeRWKV7ForCausalLM(纯 PyTorch,无 fla kernel)做训练,序列级 SFT 正常。FLA wrapper 推理可用、训练 backward 阻塞;**native 模型推理+训练在 Blackwell 都通**。
+
+### 2026-07-01 — TRL SFTTrainer on native(生产包装层)集成坑(follow-up)
+核心训练路径(native 手动 SFT + 回归测试 `test_native_training_smoke.py`)已证在 5070 工作(loss 1.56→0.44)。但 **TRL `SFTTrainer` 直接套 native 模型还有集成坑**:
+1. `gradient_checkpointing` 默认开 → native 不支持(关掉可绕过)。
+2. 关掉后 Trainer `compute_loss` 调到 `_forward_unimplemented`(默认 PreTrainedModel.forward),没路由到 NativeRWKV7ForCausalLM.forward——是 Trainer 包装层与 native 模型的路由问题,需调试(可能 SFTTrainer 对模型 forward 签名/包装有假设)。
+**结论**:Blackwell **native 训练能力已证(手动 + 测试)**;TRL SFTTrainer 生产包装的适配是**后续 polish**(非 sm_120 阻塞,是 Trainer 集成)。FLA wrapper 的 SFTTrainer 在 V100 工作(main 已覆盖),Blackwell 用 native 时走手动/trainer-adapted 路径。
