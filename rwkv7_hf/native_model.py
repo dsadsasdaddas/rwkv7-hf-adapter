@@ -22,6 +22,17 @@ from transformers.modeling_utils import PreTrainedModel
 
 from .native import _init_state, _step_token
 
+# Optional fast decode via the JIT-fused block_step (gate H2). Falls back to the
+# eager _step_token when native_jit is unavailable.
+try:
+    from .native_jit import extract as _nj_extract
+    from .native_jit import step as _nj_step
+    _HAS_NATIVE_JIT = True
+except Exception:  # pragma: no cover
+    _HAS_NATIVE_JIT = False
+    _nj_extract = None
+    _nj_step = None
+
 
 class NativeRWKV7Config(PretrainedConfig):
     """Standalone RWKV-7 config (no fla import). Carries the converted fields."""
@@ -134,6 +145,14 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
         self.model = NativeRWKV7Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def _get_packs(self):
+        """Lazy-cache the JIT weight packs for fast decode (gate H2)."""
+        packs = getattr(self, "_nj_packs", None)
+        if packs is None and _HAS_NATIVE_JIT:
+            packs = _nj_extract(self)
+            self._nj_packs = packs
+        return packs
+
     def _run(self, token_ids, state, xpa, xpf, v_first, device, dtype):
         """Sequentially advance over token_ids [T] (T>=1), threading state."""
         base = self.model
@@ -150,17 +169,30 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
         device, dtype = input_ids.device, base.embeddings.weight.dtype
         if past_key_values is None:
             state, xpa, xpf, v_first = _init_state(self, device, dtype)
-            toks = input_ids[0]
+            logits, state, xpa, xpf, v_first = self._run(
+                input_ids[0], state, xpa, xpf, v_first, device, dtype)
         else:
             state, xpa, xpf, v_first = past_key_values
-            toks = input_ids[0, -1:]  # single new token in incremental decode
-        logits, state, xpa, xpf, v_first = self._run(
-            toks, state, xpa, xpf, v_first, device, dtype)
+            x = F.embedding(input_ids[0, -1:], base.embeddings.weight).reshape(-1)
+            packs = self._get_packs()
+            if packs is not None:
+                # Fast decode: JIT-fused block_step (gate H2).
+                x, state, xpa, xpf, v_first = _nj_step(
+                    self, x, state, xpa, xpf, v_first, packs)
+            else:
+                x, state, xpa, xpf, v_first = _step_token(
+                    self, x, state, xpa, xpf, v_first)
+            x = base.norm(x)
+            logits = F.linear(x, self.lm_head.weight).view(1, 1, -1)
         new_cache = (state, xpa, xpf, v_first) if use_cache else None
         return CausalLMOutputWithPast(logits=logits, past_key_values=new_cache)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
+        # NOTE: a proper recurrent Cache (so HF generate threads state and the
+        # JIT decode path is used) is gate H2 — for now generate re-prefills the
+        # prompt each step (correct but O(n^2)-slow). Fast generate needs a
+        # Cache wrapper like RWKV7StateCache.
         return {"input_ids": input_ids, "past_key_values": past_key_values,
                 "use_cache": past_key_values is not None}
