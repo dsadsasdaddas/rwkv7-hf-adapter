@@ -28,11 +28,11 @@ def attn_step(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tensor,
     xa = x + xx * layer.x_a.reshape(-1)
     xg = x + xx * layer.x_g.reshape(-1)
 
-    r = F.linear(xr, layer.r_proj.weight)
+    r = layer.r_proj(xr)
     w = F.linear(torch.tanh(F.linear(xw, layer.w_lora.lora[0].weight)),
                  layer.w_lora.lora[2].weight, layer.w_lora.lora[2].bias)
-    k = F.linear(xk, layer.k_proj.weight)
-    v = F.linear(xv, layer.v_proj.weight)
+    k = layer.k_proj(xk)
+    v = layer.v_proj(xv)
     a = torch.sigmoid(layer.a_lora.lora[2].bias +
                       F.linear(F.linear(xa, layer.a_lora.lora[0].weight),
                                layer.a_lora.lora[2].weight))
@@ -60,7 +60,7 @@ def attn_step(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tensor,
                        eps=N * 1e-5).view(H * N)
     sk = (r.view(H, N) * k.view(H, N) * layer.r_k).sum(dim=-1, keepdim=True)
     out = out + (sk * v.view(H, N)).view(H * N)
-    out = F.linear(out * g, layer.o_proj.weight)
+    out = layer.o_proj(out * g)
     return out, x, state, v_first
 
 
@@ -92,11 +92,11 @@ def attn_step_batched(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tenso
     xa = x + xx * layer.x_a.reshape(1, hidden)
     xg = x + xx * layer.x_g.reshape(1, hidden)
 
-    r = F.linear(xr, layer.r_proj.weight)
+    r = layer.r_proj(xr)
     w = F.linear(torch.tanh(F.linear(xw, layer.w_lora.lora[0].weight)),
                  layer.w_lora.lora[2].weight, layer.w_lora.lora[2].bias)
-    k = F.linear(xk, layer.k_proj.weight)
-    v = F.linear(xv, layer.v_proj.weight)
+    k = layer.k_proj(xk)
+    v = layer.v_proj(xv)
     a = torch.sigmoid(layer.a_lora.lora[2].bias +
                       F.linear(F.linear(xa, layer.a_lora.lora[0].weight),
                                layer.a_lora.lora[2].weight))
@@ -124,7 +124,7 @@ def attn_step_batched(layer, layer_id: int, x: torch.Tensor, x_prev: torch.Tenso
                        eps=N * 1e-5)
     sk = (r.view(B, H, N) * k.view(B, H, N) * layer.r_k.reshape(1, H, N)).sum(dim=-1, keepdim=True)
     out = out + (sk * v.view(B, H, N)).view(B, hidden)
-    out = F.linear(out * g, layer.o_proj.weight)
+    out = layer.o_proj(out * g)
     return out, x, state, v_first
 
 
