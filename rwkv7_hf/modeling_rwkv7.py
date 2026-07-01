@@ -837,6 +837,17 @@ class RWKV7ForCausalLM(_RWKV7ForCausalLM):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        if os.environ.get("RWKV7_NATIVE_MODEL", "0") not in _FALSE_VALUES:
+            # Opt-in fla-free backend: load NativeRWKV7ForCausalLM instead of
+            # the FLA wrapper. Same checkpoint, same HF from_pretrained/generate
+            # API; bypasses the fla runtime dependency and the FLA backward
+            # kernels that fail on some GPUs (e.g. Blackwell sm_120 shared-mem).
+            from .native_model import NativeRWKV7ForCausalLM
+
+            kwargs.pop("rwkv7_bnb_skip_policy", None)
+            return NativeRWKV7ForCausalLM.from_pretrained(
+                pretrained_model_name_or_path, *model_args, **kwargs
+            )
         rwkv7_bnb_skip_policy = _bnb_skip_policy(kwargs.pop("rwkv7_bnb_skip_policy", None))
         quantization_config = kwargs.get("quantization_config")
         if quantization_config is None and (kwargs.get("load_in_8bit") or kwargs.get("load_in_4bit")):
