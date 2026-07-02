@@ -144,17 +144,21 @@ A100 fast-token batch sweep, `rwkv7_forward_token`, `native_graph`,
 | 7.2B | fp16 | 1,2 | 59.2 | 117.2 | 16336.1 MB |
 | 7.2B | bf16 | 1,2 | 58.5 | 117.1 | 16336.1 MB |
 
-Quantized A100 memory and decode telemetry:
+Quantized A100 memory and interim decode telemetry:
 
-| Model | fp16 footprint / decode | 8bit footprint / decode | 4bit footprint / decode |
+| Model | fp16 footprint / decode | 8bit footprint / decode (interim) | 4bit footprint / decode (interim) |
 |---|---:|---:|---:|
 | 0.4B | 859.8 MB / 144.8 tok/s | 571.8 MB / 12.3 tok/s | 427.8 MB / 25.3 tok/s |
 | 1.5B | 2913.3 MB / 119.5 tok/s | 1761.3 MB / 11.5 tok/s | 1185.3 MB / 25.0 tok/s |
 | 2.9B | 5622.4 MB / 73.5 tok/s | 3222.4 MB / 8.9 tok/s | 2022.4 MB / 19.2 tok/s |
 | 7.2B | 13731.3 MB / 61.4 tok/s | 7587.3 MB / 7.0 tok/s | 4515.3 MB / 15.3 tok/s |
 
-All W8/W4 rows reduce memory; they are still slower than fp16/native-graph and
-therefore remain part of the fused/native quantization performance gap.
+All W8/W4 rows reduce memory. Their decode-speed fields are marked
+`quant_speed_status=interim` in `bench/results.jsonl` because the native-fused
+packed-quant / tensor-core-aware kernel work is expected to replace these
+generic bitsandbytes speed numbers; they are still slower than
+fp16/native-graph and therefore remain part of the fused/native quantization
+performance gap.
 
 Training and resume coverage:
 
@@ -167,10 +171,11 @@ Training and resume coverage:
 
 The A100 40GB validation block brings `bench/results.jsonl` to 134 A100 rows:
 68 batch-sweep rows, 20 DeepSpeed base rows, 16 single-GPU training rows, 12
-quantization rows, 8 DeepSpeed resume rows, 4 large-model smoke rows, 4 HF
-checkpoint-resume rows, and the 2 legacy 0.1B speed rows from #82. A100 80GB
-was not available in the current cluster. ZeRO3 checkpoint resume still
-requires a follow-up DeepSpeed/PyTorch dtype-mismatch fix.
+quantization rows including 8 W8/W4 rows with interim speed status, 8
+DeepSpeed resume rows, 4 large-model smoke rows, 4 HF checkpoint-resume rows,
+and the 2 legacy 0.1B speed rows from #82. A100 80GB was not available in the
+current cluster. ZeRO3 checkpoint resume still requires a follow-up
+DeepSpeed/PyTorch dtype-mismatch fix.
 
 ## Current V100 status
 

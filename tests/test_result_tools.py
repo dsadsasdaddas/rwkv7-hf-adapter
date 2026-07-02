@@ -199,6 +199,8 @@ def assert_quantization_best_variants_are_reported(tmpdir: Path) -> None:
             "decode_tokps": 80.0,
             "model_footprint_mb": 280.0,
             "peak_vram_mb": 340.0,
+            "quant_speed_status": "interim",
+            "quant_speed_note": "pending native-fused W8/W4 kernel update",
         },
         {
             "axis": "quantization",
@@ -211,6 +213,8 @@ def assert_quantization_best_variants_are_reported(tmpdir: Path) -> None:
             "decode_tokps": 50.0,
             "model_footprint_mb": 300.0,
             "peak_vram_mb": 360.0,
+            "quant_speed_status": "interim",
+            "quant_speed_note": "pending native-fused W8/W4 kernel update",
         },
     ]
     path = tmpdir / "quant_results.jsonl"
@@ -236,10 +240,15 @@ def assert_quantization_best_variants_are_reported(tmpdir: Path) -> None:
     report = json.loads(analyzed.stdout)
     best_by_mode = {row["quantization"]: row for row in report["quantization_best_variants"]}
     assert best_by_mode["4bit"]["best_speed"]["quant_skip_policy"] == "decode_hot"
+    assert best_by_mode["4bit"]["best_speed"]["quant_speed_status"] == "interim"
     assert best_by_mode["4bit"]["best_memory"]["quant_skip_policy"] == "memory"
     assert best_by_mode["4bit"]["decode_ratio_vs_fp16"] == 0.4
     assert best_by_mode["4bit"]["footprint_ratio_vs_fp16"] == 0.7
     assert best_by_mode["8bit"]["decode_ratio_vs_fp16"] == 0.25
+    fused_quant = {row["quantization"]: row for row in report["fused_backend_targets"]["quantization"]}
+    assert fused_quant["4bit"]["speed_status"] == "interim"
+    assert fused_quant["8bit"]["speed_status"] == "interim"
+    assert any("quantized speed rows marked interim" in item for item in report["next_focus"])
     assert any("best 4bit quant variant policy=decode_hot" in item for item in report["next_focus"])
 
 

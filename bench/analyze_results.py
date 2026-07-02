@@ -420,6 +420,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                         "reference_decode_tokps",
                         "fast_decode_tokps",
                         "fast_forward_backend",
+                        "quant_speed_status",
+                        "quant_speed_note",
                         "model_footprint_mb",
                         "peak_vram_mb",
                     ],
@@ -432,6 +434,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                         "decode_tokps",
                         "model_footprint_mb",
                         "peak_vram_mb",
+                        "quant_speed_status",
+                        "quant_speed_note",
                     ],
                 ),
                 "decode_ratio_vs_fp16": round(ratio(best_decode, quant_base_decode_for_variants), 4)
@@ -612,6 +616,7 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                 "footprint_ratio_vs_fp16": footprint_ratio,
                 "footprint_target_le": footprint_target,
                 "footprint_status": verdict_le(footprint_ratio, footprint_target) if footprint_target is not None else "PENDING",
+                "speed_status": (row.get("best_speed") or {}).get("quant_speed_status") or "measured",
             }
         )
     fused_backend_targets = {
@@ -1372,6 +1377,16 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
         focus.append(f"quantization validation incomplete: missing passing {missing}")
     quant_by_mode = {r.get("quantization"): r for r in quant_latest if r.get("status") == "pass"}
     quant_base_decode = num(quant_by_mode.get("none"), "decode_tokps")
+    interim_quant_speed_modes = sorted({
+        str(row.get("quantization"))
+        for row in quant_variant_latest
+        if row.get("status") == "pass" and row.get("quant_speed_status") == "interim"
+    })
+    if interim_quant_speed_modes:
+        focus.append(
+            "quantized speed rows marked interim pending native-fused kernel update: "
+            + ",".join(interim_quant_speed_modes)
+        )
     if quant_base_decode:
         slow = []
         for mode in ("8bit", "4bit"):
@@ -1785,6 +1800,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     "fast_forward_backend",
                     "fast_forward_max_abs_diff",
                     "fast_forward_same_next_token",
+                    "quant_speed_status",
+                    "quant_speed_note",
                     "quant_skip_policy",
                     "quant_skip_modules",
                     "module_counts",
@@ -1809,6 +1826,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     "decode_tokps",
                     "reference_decode_tokps",
                     "fast_decode_tokps",
+                    "quant_speed_status",
+                    "quant_speed_note",
                     "model_footprint_mb",
                     "peak_vram_mb",
                     "module_counts",
@@ -1836,6 +1855,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     "fast_decode_tokps",
                     "fast_forward_backend",
                     "fast_forward_same_next_token",
+                    "quant_speed_status",
+                    "quant_speed_note",
                     "model_footprint_mb",
                     "peak_vram_mb",
                     "hidden_size",

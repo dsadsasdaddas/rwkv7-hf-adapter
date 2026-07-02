@@ -21,7 +21,7 @@ Notes:
 - All training rows use PEFT LoRA trainable parameters through the HF Trainer / TRL harnesses and assert finite loss plus a non-zero trainable-parameter delta.
 - ZeRO3 base training smoke passes for all four sizes on 2 x A100 40GB. ZeRO3 checkpoint resume remains a follow-up: a direct ZeRO3 resume attempt reproduced a DeepSpeed/PyTorch dtype mismatch in `all_gather_into_tensor` during checkpoint epilogue.
 - A100 80GB was not available in the current cluster. This pass records A100 40GB evidence only.
-- Quantized W8/W4 rows reduce memory for all four sizes, but generic bitsandbytes decode is still slower than fp16/native-graph. The speed target remains a fused/native quantized kernel task.
+- Quantized W8/W4 rows reduce memory for all four sizes. Their decode-speed fields are marked interim pending the native-fused packed-quant / tensor-core-aware kernel work; generic bitsandbytes decode is still slower than fp16/native-graph.
 
 ## Model assets
 
@@ -146,22 +146,25 @@ The table reports the `rwkv7_forward_token` rows. The same JSONL block also keep
 
 ## Quantized inference
 
-| Model | Quantization | Footprint MB | Peak VRAM MB | Decode tok/s | Load s |
-|---|---|---:|---:|---:|---:|
-| 0.4B | fp16 none | 859.8 | 921.9 | 144.8 | 2.53 |
-| 0.4B | 8bit | 571.8 | 629.6 | 12.3 | 2.18 |
-| 0.4B | 4bit | 427.8 | 502.6 | 25.3 | 1.06 |
-| 1.5B | fp16 none | 2913.3 | 3012.4 | 119.5 | 3.19 |
-| 1.5B | 8bit | 1761.3 | 1853.2 | 11.5 | 3.39 |
-| 1.5B | 4bit | 1185.3 | 1345.7 | 25.0 | 2.58 |
-| 2.9B | fp16 none | 5622.4 | 5770.4 | 73.5 | 4.06 |
-| 2.9B | 8bit | 3222.4 | 3358.5 | 8.9 | 4.75 |
-| 2.9B | 4bit | 2022.4 | 2301.2 | 19.2 | 4.83 |
-| 7.2B | fp16 none | 13731.3 | 13953.0 | 61.4 | 6.46 |
-| 7.2B | 8bit | 7587.3 | 7887.7 | 7.0 | 12.37 |
-| 7.2B | 4bit | 4515.3 | 5195.6 | 15.3 | 10.11 |
+| Model | Quantization | Footprint MB | Peak VRAM MB | Decode tok/s | Speed status | Load s |
+|---|---|---:|---:|---:|---|---:|
+| 0.4B | fp16 none | 859.8 | 921.9 | 144.8 | baseline | 2.53 |
+| 0.4B | 8bit | 571.8 | 629.6 | 12.3 | interim | 2.18 |
+| 0.4B | 4bit | 427.8 | 502.6 | 25.3 | interim | 1.06 |
+| 1.5B | fp16 none | 2913.3 | 3012.4 | 119.5 | baseline | 3.19 |
+| 1.5B | 8bit | 1761.3 | 1853.2 | 11.5 | interim | 3.39 |
+| 1.5B | 4bit | 1185.3 | 1345.7 | 25.0 | interim | 2.58 |
+| 2.9B | fp16 none | 5622.4 | 5770.4 | 73.5 | baseline | 4.06 |
+| 2.9B | 8bit | 3222.4 | 3358.5 | 8.9 | interim | 4.75 |
+| 2.9B | 4bit | 2022.4 | 2301.2 | 19.2 | interim | 4.83 |
+| 7.2B | fp16 none | 13731.3 | 13953.0 | 61.4 | baseline | 6.46 |
+| 7.2B | 8bit | 7587.3 | 7887.7 | 7.0 | interim | 12.37 |
+| 7.2B | 4bit | 4515.3 | 5195.6 | 15.3 | interim | 10.11 |
 
-All quantized rows are functional and reduce memory. They do not close the production speed target; W8/W4 still need a native packed/fused serving path.
+All quantized rows are functional and reduce memory. W8/W4 decode-speed rows
+are also tagged with `quant_speed_status=interim` in `bench/results.jsonl`.
+They do not close the production speed target; W8/W4 still need a native
+packed/fused serving path.
 
 ## Single-GPU training and resume
 
@@ -230,5 +233,5 @@ Remaining A100-specific gaps after this pass:
 
 - A100 80GB validation is not available on the current cluster.
 - ZeRO3 checkpoint resume needs a DeepSpeed/PyTorch dtype-mismatch fix.
-- Quantized decode needs fused/native W8/W4 kernels to meet the "not slower than fp16" target.
-- Longer production training sweeps remain useful, but the requested larger-model smoke, batch sweep, quantized speed telemetry, HF checkpoint resume, ZeRO base, and ZeRO2 resume evidence is now present for A100 40GB.
+- Quantized decode needs fused/native W8/W4 kernels to meet the "not slower than fp16" target; current W8/W4 speed rows are interim.
+- Longer production training sweeps remain useful, but the requested larger-model smoke, batch sweep, quantized functional/memory evidence, interim quantized speed telemetry, HF checkpoint resume, ZeRO base, and ZeRO2 resume evidence is now present for A100 40GB.
