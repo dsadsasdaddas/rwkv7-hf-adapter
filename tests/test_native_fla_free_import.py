@@ -27,7 +27,9 @@ from pathlib import Path
 class BlockFla(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "fla" or fullname.startswith("fla."):
-            raise ImportError("blocked fla for fla-free native backend test")
+            # Match CPU-only hosts where FLA is installed but Triton/CUDA driver
+            # probing raises a non-ImportError before the native fallback can run.
+            raise RuntimeError("blocked/broken fla for fla-free native backend test")
         return None
 
 

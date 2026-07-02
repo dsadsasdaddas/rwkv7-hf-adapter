@@ -196,6 +196,7 @@ class NativeRWKV7Model(PreTrainedModel):
 
     def __init__(self, config: NativeRWKV7Config):
         super().__init__(config)
+        self.gradient_checkpointing = False
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([NativeRWKV7Layer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = nn.LayerNorm(config.hidden_size)
@@ -212,6 +213,7 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
 
     config_class = NativeRWKV7Config
     base_model_prefix = "model"
+    supports_gradient_checkpointing = True
     _no_split_modules = ["NativeRWKV7Layer"]
     # Transformers >=5 expects dict-like _tied_weights_keys; RWKV-7 ties nothing.
     _tied_weights_keys = {}
@@ -222,6 +224,7 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
 
     def __init__(self, config: NativeRWKV7Config):
         super().__init__(config)
+        self.gradient_checkpointing = False
         self.model = NativeRWKV7Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -236,6 +239,15 @@ class NativeRWKV7ForCausalLM(PreTrainedModel, GenerationMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def resize_token_embeddings(self, new_num_tokens: int | None = None, *args, **kwargs):
+        """Keep the official RWKV trie vocabulary fixed in the native backend."""
+        if new_num_tokens is None or int(new_num_tokens) == int(self.config.vocab_size):
+            return self.get_input_embeddings()
+        raise NotImplementedError(
+            "RWKV-7 uses the fixed official trie vocabulary; changing vocab size "
+            "with resize_token_embeddings is not supported by this adapter."
+        )
 
     def rwkv7_native_model_last_decode_backend(self) -> str | None:
         """Return the backend used by the previous native-model decode call."""

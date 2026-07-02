@@ -5,6 +5,7 @@ Requires flash-linear-attention (`fla`) on PYTHONPATH / installed in the env.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import weakref
 from collections import OrderedDict
@@ -17,10 +18,19 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 _FLA_IMPORT_ERROR: Exception | None = None
 
 try:
-    from fla.models.rwkv7.modeling_rwkv7 import RWKV7Model as _RWKV7Model
-    from fla.models.rwkv7.modeling_rwkv7 import RWKV7ForCausalLM as _RWKV7ForCausalLM
-    from fla.models.utils import Cache as _FLACache
-    from fla.ops.rwkv7.fused_recurrent import fused_mul_recurrent_rwkv7
+    # Keep FLA behind dynamic imports.  Transformers remote-code dependency
+    # checks import top-level packages found in static ``from fla...`` lines
+    # before this module executes; on CPU-only hosts an installed FLA/Triton can
+    # raise a non-ImportError while probing CUDA drivers.  Dynamic imports let
+    # the fla-free native backend remain importable while preserving the same
+    # optimized wrapper path when FLA is usable.
+    _fla_modeling = importlib.import_module("fla.models.rwkv7.modeling_rwkv7")
+    _RWKV7Model = _fla_modeling.RWKV7Model
+    _RWKV7ForCausalLM = _fla_modeling.RWKV7ForCausalLM
+    _FLACache = importlib.import_module("fla.models.utils").Cache
+    fused_mul_recurrent_rwkv7 = importlib.import_module(
+        "fla.ops.rwkv7.fused_recurrent"
+    ).fused_mul_recurrent_rwkv7
 except Exception as exc:  # pragma: no cover - exercised by fla-free native backend tests
     _FLA_IMPORT_ERROR = exc
     from transformers.cache_utils import Cache as _FLACache

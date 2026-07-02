@@ -84,7 +84,10 @@ def main() -> int:
 
     beam_idx = torch.tensor([1, 0], dtype=torch.long, device=batch["input_ids"].device)
     reordered = model._reorder_cache(out.past_key_values, beam_idx)
-    assert reordered is out.past_key_values
+    assert reordered is not None
+    # The optimized FLA wrapper mutates/keeps a cache object, while the native
+    # fla-free backend returns a re-indexed recurrent cache.  Both satisfy the
+    # HF GenerationMixin contract as long as sequence length survives reorder.
     assert reordered.get_seq_length() >= batch["input_ids"].shape[1]
 
     if args.beam_new_tokens > 0:

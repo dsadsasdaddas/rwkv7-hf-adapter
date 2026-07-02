@@ -70,8 +70,17 @@ def main() -> int:
 
     with torch.no_grad():
         cached = model(input_ids=input_ids[:, :3], use_cache=True)
-        assert cached.logits.shape == (2, 1, 23)
+        # A first, no-past CausalLM forward should keep full-prefix logits so
+        # HF evaluation / DPO-style logprob code can score every token.  The
+        # incremental decode path should switch to last-token logits once a
+        # recurrent cache is supplied.
+        assert cached.logits.shape == (2, 3, 23)
         assert cached.past_key_values is not None
+        assert cached.past_key_values.get_seq_length() == 3
+        decoded = model(input_ids=input_ids[:, 3:4], past_key_values=cached.past_key_values, use_cache=True)
+        assert decoded.logits.shape == (2, 1, 23)
+        assert decoded.past_key_values is not None
+        assert decoded.past_key_values.get_seq_length() == 4
 
     try:
         model(input_ids=input_ids, labels=labels[:, :4])
