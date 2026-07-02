@@ -2490,6 +2490,105 @@ def assert_deepspeed_resume_smoke_survives_inference_dtype_filter(tmpdir: Path) 
     assert any("DeepSpeed ZeRO resume passes for stages [2]" in item for item in report["next_focus"])
 
 
+def assert_model_aware_focus_checks_do_not_overwrite_deepspeed_rows(tmpdir: Path) -> None:
+    rows = []
+    for label, delta in (("0.4b", 0.0), ("1.5b", 1e-4)):
+        for stage in (2, 3):
+            rows.append(
+                {
+                    "axis": "deepspeed_training_smoke",
+                    "backend": "hf_adapter",
+                    "trainer_backend": f"trainer_zero{stage}",
+                    "zero_stage": stage,
+                    "status": "pass",
+                    "model_size_label": label,
+                    "model_name": f"rwkv7-{label}-hf",
+                    "hf_model_dir": f"/models/rwkv7-{label}-hf",
+                    "dtype": "bf16",
+                    "train_dtype": "bf16",
+                    "device": "NVIDIA A100-PCIE-40GB",
+                    "cuda_device_count": 2,
+                    "attn_mode": "fused_recurrent",
+                    "batch_size": 1,
+                    "gradient_accumulation_steps": 1,
+                    "effective_batch_size": 1,
+                    "max_steps": 1,
+                    "deepspeed_config": f"configs/deepspeed/zero{stage}.json",
+                    "train_loss": 1.0,
+                    "train_runtime_s": 1.0,
+                    "train_samples_per_second": 1.0,
+                    "train_steps_per_second": 1.0,
+                    "max_trainable_delta": delta if stage == 2 else 1e-4,
+                }
+            )
+        rows.append(
+            {
+                "axis": "deepspeed_resume_smoke",
+                "backend": "hf_adapter",
+                "trainer_backend": "trainer_zero2_resume",
+                "zero_stage": 2,
+                "status": "pass",
+                "model_size_label": label,
+                "model_name": f"rwkv7-{label}-hf",
+                "hf_model_dir": f"/models/rwkv7-{label}-hf",
+                "dtype": "bf16",
+                "train_dtype": "bf16",
+                "device": "NVIDIA A100-PCIE-40GB",
+                "cuda_device_count": 2,
+                "distributed_world_size": 2,
+                "local_rank": 0,
+                "attn_mode": "fused_recurrent",
+                "batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "effective_batch_size": 1,
+                "first_steps": 1,
+                "resume_steps": 2,
+                "global_step": 2,
+                "checkpoint": "checkpoint-1",
+                "deepspeed_config": "configs/deepspeed/zero2.json",
+                "first_loss": 1.0,
+                "resume_loss": 0.9,
+                "train_runtime_s": 1.0,
+                "first_max_trainable_delta": 1e-4,
+                "resume_max_trainable_delta": delta,
+            }
+        )
+
+    path = tmpdir / "model_aware_deepspeed_results.jsonl"
+    write_jsonl(path, rows)
+    analyzed = subprocess.run(
+        [
+            sys.executable,
+            "bench/analyze_results.py",
+            "--results",
+            str(path),
+            "--device",
+            "A100",
+            "--dtype",
+            "fp16",
+            "--json",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert analyzed.returncode == 0, analyzed.stdout + analyzed.stderr
+    report = json.loads(analyzed.stdout)
+    assert any(
+        "DeepSpeed ZeRO-2 smoke did not update trainable params for 0.4b" in item
+        for item in report["next_focus"]
+    )
+    assert any(
+        "DeepSpeed ZeRO-2 resume did not update trainable params for 0.4b" in item
+        for item in report["next_focus"]
+    )
+    assert not any(
+        "DeepSpeed ZeRO-2 smoke did not update trainable params for 1.5b" in item
+        for item in report["next_focus"]
+    )
+
+
 def main() -> int:
     rows = [
         {
@@ -2609,6 +2708,7 @@ def main() -> int:
         assert_deepspeed_smoke_survives_inference_dtype_filter(tmpdir)
         assert_checkpoint_resume_smoke_survives_inference_dtype_filter(tmpdir)
         assert_deepspeed_resume_smoke_survives_inference_dtype_filter(tmpdir)
+        assert_model_aware_focus_checks_do_not_overwrite_deepspeed_rows(tmpdir)
     args = argparse.Namespace(device="V100", dtype="fp16")
     speeds = latest_by_layout(fast_speed_rows(loaded, args))
     micros = latest_by_layout(fast_micro_rows(loaded, args))
