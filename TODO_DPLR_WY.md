@@ -330,6 +330,40 @@ Branch: `wangyue/native-prefill-060-albatross`
     This is still useful because it validates the integration/build path and
     gives the next CUDA task a concrete target: increase parallelism and reduce
     per-token global/shared synchronization, not promote this first kernel.
+- [x] Add the first card-specific sm70/V100 tuning rule:
+  - V100 server validation target: `Tesla V100-PCIE-32GB`, sm70, fp16,
+    0.4B / prompt512 / bsz1, current repo code on branch
+    `wangyue/native-prefill-060-albatross`.
+  - Created a clean V100 checkout at
+    `/home/data/wangyue/projects/rwkv7-hf-adapter-prefill060-v100` instead
+    of touching the dirty legacy main checkout.
+  - Environment: `/home/data/wangyue/envs/rwkv7` with PyTorch
+    `2.5.1+cu124`; the older cu118 env exposes a FLA import incompatibility
+    with `torch.distributed.tensor.Replicate` and is not the preferred FLA
+    benchmark env.
+  - Result files:
+    - `bench/results_v100_prefill060_sm70_block_sweep_20260703_003614.jsonl`
+    - `bench/results_v100_prefill060_sm70_auto_default_20260703_004617.jsonl`
+  - Remote row sources:
+    - `/tmp/native_v100_prefill060_sm70_block_sweep_20260703_003614.jsonl`
+    - `/tmp/native_v100_prefill060_sm70_auto_default_v2_20260703_004617.jsonl`
+  - Sweep rows all pass greedy/cache smoke. Best V100 row is split-row
+    `block_m=16,num_warps=4,num_stages=3`: `16,379.5 tok/s`,
+    `31.2586 ms`, peak `1144.2 MiB`, max diff `0.0625`.
+  - Full-head `block_m=64,num_warps=8` is slower on V100: `14,053.3 tok/s`,
+    so sm70 should not inherit the Ada/4090 full-head default.
+  - Implemented an architecture-aware default: for CUDA sm70 and
+    `head_dim=64`, `_native_prefill_scan_block_m(...)` defaults to `16`,
+    which then defaults `_native_prefill_scan_num_warps(...)` to `4`; explicit
+    `RWKV7_NATIVE_PREFILL_SCAN_BLOCK_M` / `RWKV7_NATIVE_PREFILL_SCAN_NUM_WARPS`
+    still override this for reproducible sweeps.
+  - Fixed benchmark/profiler telemetry to report the effective default
+    scan block size instead of always reporting raw `head_dim` when the env
+    override is absent.
+  - Confirmation with no block/warp env after the default change: pass,
+    reported `scan_block_m=16,scan_num_warps=4`, `16,187.9 tok/s`,
+    `31.6286 ms`, peak `1144.2 MiB`.
+
 - [ ] Next corrected-harness experiment:
   - remaining credible path is no longer wrapper/projection fusion. Target the
     internal full-head `fused_recurrent_scan_state_prep` kernel itself, likely

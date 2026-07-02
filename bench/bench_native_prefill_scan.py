@@ -121,7 +121,8 @@ def scan_block_m(model) -> int | None:
         except ValueError:
             return None
     try:
-        return int(model._rwkv7_native_jit_packs()[0][2])
+        head_dim = int(model._rwkv7_native_jit_packs()[0][2])
+        return model_native_jit_module(model)._native_prefill_scan_block_m(head_dim)
     except Exception:
         return None
 

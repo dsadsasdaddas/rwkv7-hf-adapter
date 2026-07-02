@@ -300,10 +300,35 @@ def _native_prefill_fused_scan_output_enabled() -> bool:
         return False
 
 
+def _native_prefill_default_scan_block_m(head_dim: int) -> int:
+    """Default recurrent-scan row tile for the current CUDA architecture.
+
+    Ada/4090 validation prefers the full-head tile (`head_dim=64`), while the
+    sm70/V100 sweep prefers a narrower split-row tile.  Keep this as a default
+    only: explicit `RWKV7_NATIVE_PREFILL_SCAN_BLOCK_M` still wins so benchmark
+    rows remain reproducible.
+    """
+
+    head_dim = int(head_dim)
+    if head_dim == 64 and torch.cuda.is_available():
+        try:
+            major, _minor = torch.cuda.get_device_capability()
+        except Exception:
+            major = 0
+        if int(major) == 7:
+            return 16
+    return head_dim
+
+
 def _native_prefill_scan_block_m(head_dim: int) -> int:
     """Row tile for the optional split-row recurrent scan kernel."""
 
-    return env_int("RWKV7_NATIVE_PREFILL_SCAN_BLOCK_M", int(head_dim), lower=1, upper=int(head_dim))
+    return env_int(
+        "RWKV7_NATIVE_PREFILL_SCAN_BLOCK_M",
+        _native_prefill_default_scan_block_m(head_dim),
+        lower=1,
+        upper=int(head_dim),
+    )
 
 
 def _native_prefill_scan_num_warps(head_dim: int, block_m: int | None = None) -> int:
