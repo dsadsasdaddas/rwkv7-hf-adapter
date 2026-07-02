@@ -374,6 +374,15 @@ def _native_prefill_cuda_state_scan_enabled() -> bool:
         return False
 
 
+def _native_prefill_cuda_state_scan_lanes_per_row() -> int:
+    """Per-row CUDA parallelism for the experimental N=64 state-scan."""
+
+    value = env_int("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES", 1, lower=1, upper=16)
+    if value not in {1, 2, 4, 8, 16}:
+        raise ValueError("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES must be one of 1, 2, 4, 8, or 16")
+    return value
+
+
 def _native_prefill_fused_shift_mix_enabled() -> bool:
     """Runtime switch for prefill attention shift-mix fusion telemetry."""
 
@@ -1589,6 +1598,7 @@ def prefill(
                 and state_scan_block_m == 64
                 and x.dtype == torch.float16
             )
+            cuda_state_scan_lanes = _native_prefill_cuda_state_scan_lanes_per_row() if use_cuda_state_scan else 1
             if use_cuda_state_scan and layer_idx == 0:
                 out, new_state, k, v = cuda_state_scan_prep(
                     r.view(B, T, H, N),
@@ -1599,6 +1609,7 @@ def prefill(
                     state[layer_idx],
                     k_k,
                     k_a,
+                    lanes_per_row=cuda_state_scan_lanes,
                 )
                 v_first_seq = v.reshape(B, T, hidden)
             elif use_cuda_state_scan:
@@ -1613,6 +1624,7 @@ def prefill(
                     k_a,
                     v_first=v_first_seq.view(B, T, H, N),
                     v_gate=v_gate.view(B, T, H, N),
+                    lanes_per_row=cuda_state_scan_lanes,
                 )
             elif layer_idx == 0:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(

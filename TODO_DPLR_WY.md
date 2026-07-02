@@ -364,12 +364,43 @@ Branch: `wangyue/native-prefill-060-albatross`
     reported `scan_block_m=16,scan_num_warps=4`, `16,187.9 tok/s`,
     `31.6286 ms`, peak `1144.2 MiB`.
 
+- [x] Try row-parallel CUDA state-scan inside the dedicated CUDA scaffold:
+  - added `RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES` for the experimental
+    CUDA state-scan path. Supported values are `1`, `2`, `4`, `8`, and `16`;
+    the default remains `1`, so the CUDA path is still opt-in and unchanged
+    unless requested.
+  - implementation:
+    - new `rwkv7_state_scan_prep_n64_rowgroup_kernel` keeps the same narrow
+      fp16 / `head_dim=64` / shared-state CUDA scaffold but assigns multiple
+      CUDA threads to each state row, parallelizing the two per-row dot/reduce
+      loops that were serial in the first CUDA prototype.
+    - benchmark/profiler telemetry now records `prefill_cuda_state_scan_lanes`.
+  - validation result files:
+    - `bench/results_4090_prefill060_cuda_state_scan_lanes_smoke_20260702_165445.jsonl`
+    - `bench/results_4090_prefill060_cuda_state_scan_lanes_sweep2_20260702_165828.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_cuda_state_scan_lanes_smoke_20260702_165445.jsonl`
+    - `/tmp/native_4090_cuda_state_scan_lanes_sweep2_20260702_165828.jsonl`
+  - rows all pass greedy/cache smoke, max diff `0.0625`:
+    - Triton baseline row in the same smoke: `25,007.6 tok/s`, `20.4738 ms`.
+    - CUDA lanes=2: `9,935.7 tok/s`, slower than the original one-lane
+      scaffold.
+    - CUDA lanes=4: `14,342.8 tok/s`.
+    - CUDA lanes=8: best CUDA row, `17,062.3 tok/s`, `30.0077 ms`, about
+      `0.327x` Albatross and about `0.68x` of the same-run Triton baseline.
+    - CUDA lanes=16: `15,086.6 tok/s`.
+  - conclusion: row-level parallelism materially improves the CUDA scaffold
+    versus the first one-block/64-thread kernel (`~10.5k -> ~17.1k tok/s`),
+    but it is still well below Triton because every token still performs
+    block-wide synchronization around shared state. Keep it disabled by
+    default. The next CUDA step must change the state layout / persistent
+    schedule rather than only increasing row parallelism.
 - [ ] Next corrected-harness experiment:
-  - remaining credible path is no longer wrapper/projection fusion. Target the
-    internal full-head `fused_recurrent_scan_state_prep` kernel itself, likely
-    via an Albatross/RWKV-LM-style dedicated CUDA/persistent scan or a deeper
-    rewrite of the scan math/layout. Keep current Triton negative experiments
-    available but disabled.
+  - CUDA rowgroup testing narrowed the remaining credible path further: target
+    a persistent or layout-rewritten state scan that reduces per-token
+    `__syncthreads()` and shared-memory traffic, or a deeper Albatross/RWKV-LM
+    style CUDA scan. Do not promote wrapper/projection fusion or the current
+    rowgroup CUDA scaffold.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of

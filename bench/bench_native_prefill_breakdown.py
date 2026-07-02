@@ -564,6 +564,9 @@ def profiled_native_prefill(
                 and state_scan_block_m == 64
                 and h.dtype == torch.float16
             )
+            cuda_state_scan_lanes = (
+                native_jit._native_prefill_cuda_state_scan_lanes_per_row() if use_cuda_state_scan else 1
+            )
 
             def state_scan():
                 if use_cuda_state_scan and layer_idx == 0:
@@ -576,6 +579,7 @@ def profiled_native_prefill(
                         state[layer_idx],
                         k_k,
                         k_a,
+                        lanes_per_row=cuda_state_scan_lanes,
                     )
                 if use_cuda_state_scan:
                     return native_jit.cuda_state_scan_prep(
@@ -589,6 +593,7 @@ def profiled_native_prefill(
                         k_a,
                         v_first=v_first_seq.view(B, T, H, N),
                         v_gate=v_gate.view(B, T, H, N),
+                        lanes_per_row=cuda_state_scan_lanes,
                     )
                 if layer_idx == 0:
                     return native_jit.fused_recurrent_scan_state_prep(
@@ -923,6 +928,7 @@ def run_case(args: argparse.Namespace, tok, model, batch_size: int, prompt_token
         "scan_nomask64": scan_nomask64(),
         "prefill_cuda_state_scan_requested": os.environ.get("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN", "0").lower() not in {"0", "false", "no", "off"},
         "prefill_cuda_state_scan_effective": getattr(native_jit, "_native_prefill_cuda_state_scan_enabled", lambda: False)(),
+        "prefill_cuda_state_scan_lanes": getattr(native_jit, "_native_prefill_cuda_state_scan_lanes_per_row", lambda: 1)(),
         "fine_attention_breakdown": bool(args.fine_attn),
         "prefill_fused_scan_output_requested": os.environ.get("RWKV7_NATIVE_PREFILL_FUSED_SCAN_OUTPUT", "0").lower() not in {"0", "false", "no", "off"},
         "prefill_fused_scan_output_effective": native_jit._native_prefill_fused_scan_output_enabled(),
