@@ -585,21 +585,60 @@ Branch: `wangyue/native-prefill-060-albatross`
     one-warp worker loses enough per-row parallelism / ILP to offset saved
     vector prep, and the intra-CTA schedule still cannot overlap producer and
     worker phases across tokens.
+- [x] Add a narrow CUDA row-block micro/profiler path before another large
+  rewrite:
+  - added `bench/bench_cuda_state_scan_micro.py` and a synthetic
+    `cuda_state_scan_rowblock_phase(...)` wrapper around new CUDA phase
+    kernels.
+  - the phase kernels are cumulative and intentionally model the current
+    row-block grid outside the HF layer:
+    - phase 0: duplicated vector prep + K normalization;
+    - phase 1: phase 0 plus state-dot-KK reduction;
+    - phase 2: phase 1 plus state update;
+    - phase 3: phase 2 plus recurrent-output reduction.
+  - result file:
+    `bench/results_4090_prefill060_cuda_state_scan_micro_20260703_024500.jsonl`
+  - remote row source:
+    `/tmp/cuda_state_scan_micro_4090_confirm_20260703_024500.jsonl`
+  - 4090 / synthetic `B=1,T=512,H=16,N=64` rows:
+    - phase 0 `prep_norm`: `0.412672 ms`.
+    - phase 1 `prep_norm_state_dot`: `0.420864 ms`.
+    - phase 2 `prep_norm_state_dot_update`: `0.412704 ms`.
+    - phase 3 full cumulative: `0.510976 ms`.
+    - delta estimate:
+      `{duplicated_vector_prep_norm: 0.412672 ms, state_dot: 0.008192 ms,
+      state_update: -0.008160 ms, recurrent_output: 0.098272 ms}`.
+    - full default row-block micro: `0.486400 ms`.
+    - full warp-specialized `rpb=1` micro: `0.422912 ms`.
+    - full warp-specialized `rpb=8` micro: `0.433120 ms`.
+  - conclusion:
+    - the row-block micro path now confirms the per-layer kernel scale
+      (`~0.49-0.51 ms`, consistent with the HF breakdown's
+      `~12.9 ms / 24 layers` state-scan cost).
+    - the coarse phase deltas show duplicated vector prep / K normalization as
+      the largest standalone cumulative block, while recurrent output is the
+      next visible cost. State-dot/update deltas are too small/noisy in this
+      synthetic phase kernel to over-interpret.
+    - standalone micro prefers warp-specialized kernels, but full HF
+      confirmation did not, so micro rows are direction evidence only and not
+      promotion proof.
+    - since global-temp precompute, CTA-local sharing, and producer/worker
+      sharing all failed in full HF, another small row-block sharing variant is
+      unlikely to close the remaining `~15.7%` stretch gap. A true
+      persistent/inter-CTA CUDA rewrite remains possible but is a larger design
+      item; the next bounded experiment should pivot back to the high-upside
+      DPLR/WY compact apply/output fusion track.
 - [ ] Next corrected-harness experiment:
   - CUDA rowgroup, row-block, full precompute, reduced-temp precompute, and
     CTA-local cooperative rows-per-block plus warp-specialized producer/worker
-    testing narrowed the remaining credible CUDA path: the row-register layout
-    is viable, but every naive sharing attempt either adds global temp traffic,
-    lowers row parallelism, or serializes producer/worker phases. The next
-    concrete task should quantify the remaining row-block cost directly before
-    another large rewrite: add a narrow micro/profiler path that times the
-    row-block kernel variants outside the full HF layer and isolates vector
-    prep, state-dot, update, and recurrent-output costs. Use that evidence to
-    choose between (a) a true persistent/inter-CTA design if the duplicated
-    vector prep dominates, or (b) returning to Triton/DPLR apply-output fusion
-    if row math dominates. Do not promote wrapper/projection fusion or the
-    current rowgroup, row-block, full-precompute, reduced-temp,
-    CTA-local cooperative, or warp-specialized scaffolds.
+    testing, plus the new row-block micro/profiler, narrowed the remaining
+    credible path: the row-register CUDA layout is viable but bounded sharing
+    attempts are not enough in full HF. Return to the earlier DPLR/WY compact
+    track and implement the next bounded apply/output fusion experiment for
+    `triton_wy_compact`, using the existing synthetic correctness oracle and
+    then the corrected 4090 HF smoke. Do not promote wrapper/projection fusion
+    or the current rowgroup, row-block, full-precompute, reduced-temp,
+    CTA-local cooperative, warp-specialized, or micro-only scaffolds.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of

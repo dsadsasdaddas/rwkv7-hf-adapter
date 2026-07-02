@@ -357,6 +357,18 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             r.get("prefill_fused_projection_max_m"),
         ),
     )
+    cuda_state_scan_micro = latest_by_key(
+        [r for r in rows if r.get("axis") == "cuda_state_scan_micro" and r.get("backend") == "cuda_state_scan"],
+        lambda r: (
+            r.get("bench_case"),
+            r.get("batch_size"),
+            r.get("seq_len"),
+            r.get("heads"),
+            r.get("phase"),
+            r.get("schedule"),
+            r.get("rows_per_block"),
+        ),
+    )
     micro = latest(rows, lambda r: r.get("axis") == "decode_micro" and r.get("backend") == "hf_adapter")
     forward_fast_path = latest(rows, lambda r: r.get("axis") == "forward_fast_path" and r.get("backend") == "hf_adapter")
     generate_fast_path = latest(rows, lambda r: r.get("axis") == "generate_fast_path" and r.get("backend") == "hf_adapter")
@@ -1476,6 +1488,17 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     f"native prefill CUDA state-scan opt-in A/B ratio min={min(cuda_scan_ratios):.3f}x "
                     f"max={max(cuda_scan_ratios):.3f}x; current scaffold is correctness-first until a persistent/parallel rewrite beats Triton"
                 )
+            cuda_micro_summary = next(
+                (r for r in cuda_state_scan_micro if r.get("bench_case") == "rowblock_phase_delta_summary"),
+                None,
+            )
+            if cuda_micro_summary:
+                components = cuda_micro_summary.get("component_ms_estimate") or {}
+                focus.append(
+                    "CUDA state-scan micro row present: "
+                    f"full_phase={cuda_micro_summary.get('cuda_ms')}ms "
+                    f"components={components}; use as direction signal, not HF promotion proof"
+                )
             warp_rows = [
                 r
                 for r in native_prefill_scan
@@ -2281,6 +2304,10 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             compact(r, ["_lineno", "status", "dtype", "device", "model_size_label", "batch_size", "prompt_tokens", "tokens_total", "fused_scan_requested", "scan_block_m", "scan_num_warps", "scan_num_stages", "scan_algebraic_output", "scan_nomask64", "prefill_cuda_state_scan_requested", "prefill_cuda_state_scan_effective", "prefill_cuda_state_scan_lanes", "prefill_cuda_state_scan_precompute", "prefill_cuda_state_scan_precompute_mode", "prefill_cuda_state_scan_rows_per_block", "prefill_cuda_state_scan_schedule", "fine_attention_breakdown", "layer_breakdown", "prefill_fused_scan_output_requested", "prefill_fused_scan_output_effective", "prefill_fused_clampw_scan_requested", "prefill_fused_clampw_scan_effective", "prefill_dplr_scan_requested", "prefill_dplr_scan_effective", "prefill_dplr_chunk_size", "prefill_fused_shift_mix_requested", "prefill_fused_shift_mix_effective", "prefill_fused_state_prep_requested", "prefill_fused_state_prep_effective", "prefill_fused_state_scan_requested", "prefill_fused_state_scan_effective", "prefill_fused_state_scan_correction_requested", "prefill_fused_state_scan_correction_effective", "prefill_fused_state_scan_raw_output_requested", "prefill_fused_state_scan_raw_output_effective", "prefill_fused_output_requested", "prefill_fused_output_effective", "prefill_fused_wavg_lora_requested", "prefill_fused_wavg_lora_effective", "prefill_fused_wavg_lora_max_m", "prefill_fused_projection_requested", "prefill_fused_projection_effective", "prefill_fused_projection_max_m", "profiled_total_gpu_ms", "component_sum_ms", "profiled_tokps_total", "component_ms", "component_share", "top_components", "layer_total_ms", "top_layers_by_total", "layer_top_components", "max_abs_diff_vs_native_prefill", "greedy_match_vs_native_prefill", "peak_vram_mb"])
             for r in native_prefill_breakdown
         ],
+        "cuda_state_scan_micro": [
+            compact(r, ["_lineno", "status", "device", "dtype", "batch_size", "seq_len", "heads", "head_dim", "tokens_total", "bench_case", "phase", "phase_name", "schedule", "rows_per_block", "cuda_ms", "tokps_total", "component_ms_estimate"])
+            for r in cuda_state_scan_micro
+        ],
         "decode_micro": compact(micro, ["_lineno", "fast_decode_api_name", "fast_token_layout", "fast_token_backend", "fast_token_backend_effective", "hf_forward_fixed", "hf_forward_greedy", "hf_forward_auto_fixed", "hf_forward_auto_greedy", "hf_forward_auto_backend", "fast_decode_fixed", "fast_decode_greedy", "norm_lm_head", "lm_head", "argmax", "empty_loop", "peak_vram_mb"]),
         "forward_fast_path": compact(forward_fast_path, ["_lineno", "fast_token_backend", "fast_token_layout", "reference_forward", "hf_forward_fast", "direct_fast_token", "hf_forward_fast_backend", "direct_fast_token_backend", "max_abs_diff_auto_vs_reference", "max_abs_diff_direct_vs_reference", "peak_vram_mb"]),
         "generate_fast_path": compact(generate_fast_path, ["_lineno", "fast_token_backend", "fast_token_backend_effective", "batch_size", "reference_generate", "hf_generate_fast", "speedup_vs_reference", "generated_equal", "generated_tokens_matched", "generated_tokens_total", "prompt_tokens", "max_new_tokens", "peak_vram_mb"]),
@@ -2709,6 +2736,12 @@ def print_text(report: dict[str, Any]) -> None:
     print("\n## native_prefill_breakdown")
     if report["native_prefill_breakdown"]:
         for row in report["native_prefill_breakdown"]:
+            print(json.dumps(row, ensure_ascii=False))
+    else:
+        print("PENDING")
+    print("\n## cuda_state_scan_micro")
+    if report["cuda_state_scan_micro"]:
+        for row in report["cuda_state_scan_micro"]:
             print(json.dumps(row, ensure_ascii=False))
     else:
         print("PENDING")
