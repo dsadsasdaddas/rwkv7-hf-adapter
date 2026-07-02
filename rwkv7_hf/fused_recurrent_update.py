@@ -279,6 +279,89 @@ if _HAS_TRITON:
         )
 
     @triton.jit
+    def _recurrent_scan_state_prep_rows_kernel(
+        r_ptr,
+        w_raw_ptr,
+        k_raw_ptr,
+        v_raw_ptr,
+        a_ptr,
+        state_ptr,
+        k_k_ptr,
+        k_a_ptr,
+        v_first_ptr,
+        v_gate_ptr,
+        out_ptr,
+        final_state_ptr,
+        k_out_ptr,
+        v_out_ptr,
+        T,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        ROW_BLOCKS: tl.constexpr,
+        HAS_V_GATE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        row_block = pid % ROW_BLOCKS
+        bh_id = pid // ROW_BLOCKS
+        head_id = bh_id % H
+        batch_id = bh_id // H
+
+        offs_i = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_j = tl.arange(0, BLOCK_N)
+        mask_i = offs_i < N
+        mask_j = offs_j < N
+        state_base = (batch_id * H + head_id) * N * N
+        param_base = head_id * N
+        st = tl.load(
+            state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :],
+            mask=mask_i[:, None] & mask_j[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        kk_scale_j = tl.load(k_k_ptr + param_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+        ka_scale_j = tl.load(k_a_ptr + param_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+        ka_scale_i = tl.load(k_a_ptr + param_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+
+        t = 0
+        while t < T:
+            vec_base = ((batch_id * T + t) * H + head_id) * N
+            r = tl.load(r_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            w_raw = tl.load(w_raw_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            k_raw_j = tl.load(k_raw_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            k_raw_i = tl.load(k_raw_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+            v_raw_i = tl.load(v_raw_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+            a_j = tl.load(a_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            a_i = tl.load(a_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+
+            kk_raw = k_raw_j * kk_scale_j
+            norm2 = tl.sum(tl.where(mask_j, kk_raw * kk_raw, 0.0), axis=0)
+            kk = kk_raw * tl.rsqrt(tl.maximum(norm2, 1.0e-20))
+            k_adj_j = k_raw_j * (1.0 + (a_j - 1.0) * ka_scale_j)
+            k_adj_i = k_raw_i * (1.0 + (a_i - 1.0) * ka_scale_i)
+            v_adj_i = v_raw_i
+            if HAS_V_GATE:
+                vf_i = tl.load(v_first_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+                vg_i = tl.load(v_gate_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+                v_adj_i = v_raw_i + (vf_i - v_raw_i) * vg_i
+            w = tl.exp(-0.606531 * tl.sigmoid(w_raw))
+
+            state_dot_kk = tl.sum(st * kk[None, :], axis=1)
+            st = st * w[None, :] + v_adj_i[:, None] * k_adj_j[None, :] - state_dot_kk[:, None] * kk[None, :] * a_j[None, :]
+
+            recurrent = tl.sum(st * r[None, :], axis=1)
+            tl.store(out_ptr + vec_base + offs_i, recurrent, mask=mask_i)
+            tl.store(k_out_ptr + vec_base + offs_i, k_adj_i, mask=mask_i)
+            tl.store(v_out_ptr + vec_base + offs_i, v_adj_i, mask=mask_i)
+            t += 1
+
+        tl.store(
+            final_state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :],
+            st,
+            mask=mask_i[:, None] & mask_j[None, :],
+        )
+
+    @triton.jit
     def _recurrent_scan_rows_kernel(
         r_ptr,
         w_ptr,
@@ -1245,6 +1328,7 @@ def fused_recurrent_scan_state_prep(
     v_first: Any | None = None,
     v_gate: Any | None = None,
     block_n: int = 64,
+    block_m: int | None = None,
     num_warps: int = 8,
     force_fallback: bool = False,
 ):
@@ -1255,9 +1339,9 @@ def fused_recurrent_scan_state_prep(
     and normalized KK inside the scan, and returns ``(out, final_state, k, v)``
     so the existing attention output-prep code can keep using adjusted K/V.
 
-    The Triton path is intentionally full-head only: it avoids duplicating the
-    per-head KK normalization across row blocks and targets the 4090
-    ``N=64`` validation shape first.
+    The default Triton path is full-head.  Passing ``block_m < head_dim``
+    enables an experimental split-row variant that trades duplicated per-head
+    vector prep for more parallelism on low-batch prompt-prefill shapes.
     """
 
     if torch is None or F is None:
@@ -1269,6 +1353,11 @@ def fused_recurrent_scan_state_prep(
         raise ValueError("state must be square in the last two dimensions")
     if int(block_n) < N:
         raise ValueError(f"block_n must be >= head_dim={N}; got {block_n}")
+    if block_m is None:
+        block_m = N
+    block_m = int(block_m)
+    if block_m <= 0 or block_m > N:
+        raise ValueError(f"block_m must be in [1, head_dim={N}]; got {block_m}")
     if int(num_warps) not in {1, 2, 4, 8}:
         raise ValueError(f"num_warps must be one of 1, 2, 4, or 8; got {num_warps}")
     r4, flat = _as_bthn(r, H, N, name="r")
@@ -1336,28 +1425,55 @@ def fused_recurrent_scan_state_prep(
     final_state = torch.empty_like(state_c)
     k_out = torch.empty_like(k_c)
     v_out = torch.empty_like(v_c)
-    _recurrent_scan_state_prep_kernel[(B * H,)](
-        r_c,
-        w_c,
-        k_c,
-        v_c,
-        a_c,
-        state_c,
-        kk_c,
-        ka_c,
-        vf_c,
-        vg_c,
-        out,
-        final_state,
-        k_out,
-        v_out,
-        T,
-        H,
-        N,
-        HAS_V_GATE=bool(has_v_gate),
-        BLOCK_N=int(block_n),
-        num_warps=int(num_warps),
-    )
+    if block_m < N:
+        row_blocks = triton.cdiv(N, block_m)
+        _recurrent_scan_state_prep_rows_kernel[(B * H * row_blocks,)](
+            r_c,
+            w_c,
+            k_c,
+            v_c,
+            a_c,
+            state_c,
+            kk_c,
+            ka_c,
+            vf_c,
+            vg_c,
+            out,
+            final_state,
+            k_out,
+            v_out,
+            T,
+            H,
+            N,
+            ROW_BLOCKS=int(row_blocks),
+            HAS_V_GATE=bool(has_v_gate),
+            BLOCK_M=int(block_m),
+            BLOCK_N=int(block_n),
+            num_warps=int(num_warps),
+        )
+    else:
+        _recurrent_scan_state_prep_kernel[(B * H,)](
+            r_c,
+            w_c,
+            k_c,
+            v_c,
+            a_c,
+            state_c,
+            kk_c,
+            ka_c,
+            vf_c,
+            vg_c,
+            out,
+            final_state,
+            k_out,
+            v_out,
+            T,
+            H,
+            N,
+            HAS_V_GATE=bool(has_v_gate),
+            BLOCK_N=int(block_n),
+            num_warps=int(num_warps),
+        )
     if flat:
         return out.reshape(B, T, H * N), final_state, k_out.reshape(B, T, H * N), v_out.reshape(B, T, H * N)
     return out, final_state, k_out, v_out

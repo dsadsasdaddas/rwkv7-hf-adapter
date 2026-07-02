@@ -1154,7 +1154,8 @@ def prefill(
             use_clampw_scan = False
         state_scan_done = False
         if use_fused_state_scan:
-            state_scan_num_warps = _native_prefill_scan_num_warps(N, N)
+            state_scan_block_m = _native_prefill_scan_block_m(N)
+            state_scan_num_warps = _native_prefill_scan_num_warps(N, state_scan_block_m)
             if layer_idx == 0:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(
                     r.view(B, T, H, N),
@@ -1166,6 +1167,7 @@ def prefill(
                     k_k,
                     k_a,
                     block_n=N,
+                    block_m=state_scan_block_m,
                     num_warps=state_scan_num_warps,
                 )
                 v_first_seq = v.reshape(B, T, hidden)
@@ -1182,6 +1184,7 @@ def prefill(
                     v_first=v_first_seq.view(B, T, H, N),
                     v_gate=v_gate.view(B, T, H, N),
                     block_n=N,
+                    block_m=state_scan_block_m,
                     num_warps=state_scan_num_warps,
                 )
             out = out.reshape(B, T, hidden)

@@ -59,6 +59,26 @@ Branch: `wangyue/native-prefill-060-albatross`
     - `num_warps=8`: `26,758.3 tok/s`, `19.1343 ms`, about `0.5131x`
   - conclusion: keep Ada/4090 default at `8` warps for this shape; lower warp
     counts are valid but slower and should not be promoted as the default.
+- [x] Try split-row fused state-scan as the next direct state-scan experiment:
+  - added an opt-in `block_m < head_dim` path inside
+    `fused_recurrent_scan_state_prep(...)`, reusing
+    `RWKV7_NATIVE_PREFILL_SCAN_BLOCK_M` and
+    `RWKV7_NATIVE_PREFILL_SCAN_NUM_WARPS`.
+  - sweep result file:
+    `bench/results_4090_prefill060_state_scan_rows_20260702_202132.jsonl`
+  - confirmation result file:
+    `bench/results_4090_prefill060_state_scan_rows_confirm_20260702_202538.jsonl`
+  - remote row sources:
+    `/tmp/native_4090_060_state_scan_rows_20260702_202132.jsonl` and
+    `/tmp/native_4090_060_state_scan_rows_confirm_20260702_202538.jsonl`
+  - sweep best row was split-row `block_m=8,num_warps=4`: pass,
+    `27,004.0 tok/s`, `18.9601 ms`, about `0.5178x` Albatross.
+  - confirmation did not support promoting split-row on 4090: `block_m=8,w4`
+    fell to `26,299.1 tok/s`, while full-head `block_m=64,w8` confirmed at
+    `27,173.3 tok/s`, `18.8420 ms`, about `0.5211x`.
+  - conclusion: keep the split-row state-scan path as an experimental knob for
+    other cards/shapes, but do not make it the 4090 default. Current best
+    confirmed path remains full-head fused state-scan with `8` warps.
 - [ ] Next experiment should target the real dominant path:
   - first choice: optimize/specialize `fused_recurrent_scan_state_prep` itself
     for 4090/Ada 0.4B `H=16,N=64,T=512`, because it is now over half of the
@@ -68,7 +88,7 @@ Branch: `wangyue/native-prefill-060-albatross`
     than enabling standalone fused WAVG-LoRA or standalone fused shift-mix.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
-  `26,758.3 tok/s` (`~0.5131x`), still about `16.9%` short of the stretch.
+  `27,173.3 tok/s` (`~0.5211x`), still about `15.1%` short of the stretch.
 
 ## Temporary TODO: next 4090 push
 

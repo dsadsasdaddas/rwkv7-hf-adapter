@@ -476,7 +476,8 @@ def profiled_native_prefill(
             w, k, v, a, g, kk, v_first_seq, v_gate = profiler.measure("attn_lora_state_prep", lora_and_state_prep)
 
         if use_fused_state_scan:
-            state_scan_num_warps = native_jit._native_prefill_scan_num_warps(N, N)
+            state_scan_block_m = native_jit._native_prefill_scan_block_m(N)
+            state_scan_num_warps = native_jit._native_prefill_scan_num_warps(N, state_scan_block_m)
 
             def state_scan():
                 if layer_idx == 0:
@@ -490,6 +491,7 @@ def profiled_native_prefill(
                         k_k,
                         k_a,
                         block_n=N,
+                        block_m=state_scan_block_m,
                         num_warps=state_scan_num_warps,
                     )
                 return native_jit.fused_recurrent_scan_state_prep(
@@ -504,6 +506,7 @@ def profiled_native_prefill(
                     v_first=v_first_seq.view(B, T, H, N),
                     v_gate=v_gate.view(B, T, H, N),
                     block_n=N,
+                    block_m=state_scan_block_m,
                     num_warps=state_scan_num_warps,
                 )
 
