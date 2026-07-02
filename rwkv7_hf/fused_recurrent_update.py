@@ -1245,6 +1245,7 @@ def fused_recurrent_scan_state_prep(
     v_first: Any | None = None,
     v_gate: Any | None = None,
     block_n: int = 64,
+    num_warps: int = 8,
     force_fallback: bool = False,
 ):
     """Fuse native-prefill state prep with the recurrent scan.
@@ -1268,6 +1269,8 @@ def fused_recurrent_scan_state_prep(
         raise ValueError("state must be square in the last two dimensions")
     if int(block_n) < N:
         raise ValueError(f"block_n must be >= head_dim={N}; got {block_n}")
+    if int(num_warps) not in {1, 2, 4, 8}:
+        raise ValueError(f"num_warps must be one of 1, 2, 4, or 8; got {num_warps}")
     r4, flat = _as_bthn(r, H, N, name="r")
     w4, _ = _as_bthn(w_raw, H, N, name="w_raw")
     k4, _ = _as_bthn(k_raw, H, N, name="k_raw")
@@ -1353,7 +1356,7 @@ def fused_recurrent_scan_state_prep(
         N,
         HAS_V_GATE=bool(has_v_gate),
         BLOCK_N=int(block_n),
-        num_warps=8,
+        num_warps=int(num_warps),
     )
     if flat:
         return out.reshape(B, T, H * N), final_state, k_out.reshape(B, T, H * N), v_out.reshape(B, T, H * N)

@@ -43,6 +43,22 @@ Branch: `wangyue/native-prefill-060-albatross`
     - conclusion: do not promote the current standalone shift-mix kernel;
       Albatross-style norm+mix is still a good boundary, but it must be fused
       deeper with norm/projection instead of adding a standalone launch.
+- [x] Wire and verify fused state-scan warp specialization:
+  - `fused_recurrent_scan_state_prep(...)` now accepts a validated
+    `num_warps` argument, and native prefill/profiler pass
+    `RWKV7_NATIVE_PREFILL_SCAN_NUM_WARPS` through the existing tuning helper.
+  - result file:
+    `bench/results_4090_prefill060_state_scan_warps_20260702_121224.jsonl`
+  - remote row source:
+    `/tmp/native_4090_060_state_scan_warps_20260702_121224.jsonl`
+  - all rows pass greedy/cache smoke with `max_abs_diff=0.0625`,
+    `min_cosine=1.0`, and `989.2 MiB` peak VRAM:
+    - `num_warps=1`: `18,679.0 tok/s`, `27.4104 ms`, about `0.3582x`
+    - `num_warps=2`: `23,025.4 tok/s`, `22.2363 ms`, about `0.4415x`
+    - `num_warps=4`: `25,816.9 tok/s`, `19.8320 ms`, about `0.4951x`
+    - `num_warps=8`: `26,758.3 tok/s`, `19.1343 ms`, about `0.5131x`
+  - conclusion: keep Ada/4090 default at `8` warps for this shape; lower warp
+    counts are valid but slower and should not be promoted as the default.
 - [ ] Next experiment should target the real dominant path:
   - first choice: optimize/specialize `fused_recurrent_scan_state_prep` itself
     for 4090/Ada 0.4B `H=16,N=64,T=512`, because it is now over half of the
@@ -52,7 +68,7 @@ Branch: `wangyue/native-prefill-060-albatross`
     than enabling standalone fused WAVG-LoRA or standalone fused shift-mix.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
-  `26,487.4 tok/s` (`~0.5079x`), still about `18.1%` short of the stretch.
+  `26,758.3 tok/s` (`~0.5131x`), still about `16.9%` short of the stretch.
 
 ## Temporary TODO: next 4090 push
 
