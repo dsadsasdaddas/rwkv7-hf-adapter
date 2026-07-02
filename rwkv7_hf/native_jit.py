@@ -303,6 +303,12 @@ def _native_prefill_scan_num_stages() -> int:
     return env_int("RWKV7_NATIVE_PREFILL_SCAN_NUM_STAGES", 3, lower=1, upper=8)
 
 
+def _native_prefill_scan_algebraic_output_enabled() -> bool:
+    """Use an algebraically expanded recurrent output inside state-scan."""
+
+    return env_flag("RWKV7_NATIVE_PREFILL_SCAN_ALGEBRAIC_OUTPUT", False)
+
+
 def _native_prefill_fused_shift_mix_enabled() -> bool:
     """Runtime switch for prefill attention shift-mix fusion telemetry."""
 
@@ -1440,6 +1446,7 @@ def prefill(
             state_scan_block_m = _native_prefill_scan_block_m(N)
             state_scan_num_warps = _native_prefill_scan_num_warps(N, state_scan_block_m)
             state_scan_num_stages = _native_prefill_scan_num_stages()
+            state_scan_algebraic_output = _native_prefill_scan_algebraic_output_enabled()
             if layer_idx == 0:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(
                     r.view(B, T, H, N),
@@ -1454,6 +1461,7 @@ def prefill(
                     block_m=state_scan_block_m,
                     num_warps=state_scan_num_warps,
                     num_stages=state_scan_num_stages,
+                    algebraic_output=state_scan_algebraic_output,
                 )
                 v_first_seq = v.reshape(B, T, hidden)
             else:
@@ -1472,6 +1480,7 @@ def prefill(
                     block_m=state_scan_block_m,
                     num_warps=state_scan_num_warps,
                     num_stages=state_scan_num_stages,
+                    algebraic_output=state_scan_algebraic_output,
                 )
             out = out.reshape(B, T, hidden)
             k = k.reshape(B, T, hidden)

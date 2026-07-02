@@ -221,6 +221,33 @@ Branch: `wangyue/native-prefill-060-albatross`
     experiment, but it is negative on 4090 because the Triton dense-projection
     replacement loses badly to cuBLAS for the prefill matrix shapes. Keep it
     disabled by default and do not promote it.
+- [x] Try algebraically expanded recurrent output inside the full-head
+  state-scan:
+  - added opt-in `RWKV7_NATIVE_PREFILL_SCAN_ALGEBRAIC_OUTPUT=1`.
+  - implementation:
+    - `fused_recurrent_scan_state_prep(...)` can dispatch to an alternate
+      full-head Triton kernel that computes
+      `sum((state * w + v*k - (state@kk)*kk*a) * r)` as three dot products
+      before updating the state, instead of materializing the updated state
+      before the recurrent-output reduction.
+    - benchmark/profiler/analyzer telemetry now records
+      `scan_algebraic_output`.
+    - default HF/native behavior stays unchanged unless the env flag is set.
+  - validation result files:
+    - `bench/results_4090_prefill060_state_scan_algebraic_smoke_20260702_234644.jsonl`
+    - `bench/results_4090_prefill060_state_scan_algebraic_confirm_20260702_234722.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_state_scan_algebraic_smoke_20260702_234644.jsonl`
+    - `/tmp/native_4090_state_scan_algebraic_confirm_20260702_234722.jsonl`
+  - confirmation rows, both pass greedy/cache smoke:
+    - current baseline full-head state-scan + fused output:
+      `26,252.8 tok/s`, `19.5026 ms`, about `0.5034x` Albatross.
+    - algebraic-output scan: `25,222.8 tok/s`, `20.2991 ms`, about
+      `0.4837x` Albatross, max diff `0.125`.
+  - conclusion: correctness is acceptable, but the rewrite is slower on 4090
+    because the extra dot products increase arithmetic/register pressure inside
+    the already-dominant scan kernel. Keep it disabled by default and do not
+    promote it.
 - [ ] Next corrected-harness experiment:
   - remaining credible path is no longer wrapper/projection fusion. Target the
     internal full-head `fused_recurrent_scan_state_prep` kernel itself, likely
@@ -229,7 +256,8 @@ Branch: `wangyue/native-prefill-060-albatross`
     available but disabled.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
-  `26,745.8 tok/s` (`~0.5129x`), still about `17.0%` short of the stretch.
+  `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of
+  the stretch.
 
 ## Temporary TODO: next 4090 push
 
