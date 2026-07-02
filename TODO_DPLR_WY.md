@@ -109,12 +109,43 @@ Branch: `wangyue/native-prefill-060-albatross`
   - second choice: one larger fused attention-prep kernel that combines
     norm/shift-mix + dense R/K/V + W/A/G/V LoRA + state-scan boundary, rather
     than enabling standalone fused WAVG-LoRA or standalone fused shift-mix.
-- [ ] Next corrected-harness experiment:
+- [x] Corrected-harness breakdown and route sweep:
   - profile the corrected full-head `block_m=64,w8` current-branch path again
     to refresh the real top components after the activate/cwd fix;
-  - then either reduce `fused_recurrent_scan_state_prep` internal cost or fuse
-    a deeper pre-scan projection/LoRA boundary. Do not promote the current
-    larger state-scan+output-prep kernel.
+  - corrected breakdown result file:
+    `bench/results_4090_prefill060_corrected_breakdown_20260702_204229.jsonl`
+  - remote row source:
+    `/tmp/native_4090_060_corrected_breakdown_20260702_204229.jsonl`
+  - top corrected components:
+    - `recurrent_scan_state_prep_fused`: `12.8968 ms`, `50.27%`
+    - `ffn`: `2.1907 ms`, `8.54%`
+    - `attn_lora_w`: `1.7671 ms`, `6.89%`
+    - `attn_lora_a`: `1.6815 ms`, `6.55%`
+    - `attn_lora_v_gate`: `1.4949 ms`, `5.83%`
+    - `attn_norm_shift_mix`: `1.4366 ms`, `5.60%`
+    - `attn_lora_g`: `1.3364 ms`, `5.21%`
+  - corrected route sweep result file:
+    `bench/results_4090_prefill060_corrected_route_sweep_20260702_204349.jsonl`
+  - remote row source:
+    `/tmp/native_4090_060_corrected_route_sweep_20260702_204349.jsonl`
+  - route sweep rows:
+    - current state-scan + fused output: pass, `26,206.0 tok/s`,
+      `19.5375 ms`, about `0.5025x`
+    - state-scan without fused output: pass, `25,440.6 tok/s`, about `0.4878x`
+    - old scan+output fusion: pass, `22,769.4 tok/s`, about `0.4366x`
+    - separate fused state-prep + scan + output: pass, `22,494.3 tok/s`,
+      about `0.4314x`
+    - clampw/KV-prep route: correctness pass but not effective/usable here,
+      `220.5 tok/s`
+  - conclusion: corrected evidence keeps the same engineering direction:
+    current full-head `fused_recurrent_scan_state_prep` remains the only viable
+    4090 route and is still the dominant cost; older/shallow fusion routes are
+    worse and should stay disabled.
+- [ ] Next corrected-harness experiment:
+  - target `fused_recurrent_scan_state_prep` internal cost directly; plausible
+    next micro-variants are scan kernel `num_stages`/scheduling, reduced KV
+    writeback traffic, or moving more projection/LoRA prep into a single
+    pre-scan boundary without adding a standalone launch.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `26,395.7 tok/s` (`~0.5062x`), still about `18.5%` short of the stretch.
