@@ -366,9 +366,9 @@ Branch: `wangyue/native-prefill-060-albatross`
 
 - [x] Try row-parallel CUDA state-scan inside the dedicated CUDA scaffold:
   - added `RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES` for the experimental
-    CUDA state-scan path. Supported values are `1`, `2`, `4`, `8`, and `16`;
-    the default remains `1`, so the CUDA path is still opt-in and unchanged
-    unless requested.
+    CUDA state-scan path. The rowgroup layout supports `1`, `2`, `4`, `8`,
+    and `16`; the later row-block layout adds `64`. The default remains `1`,
+    so the CUDA path is still opt-in and unchanged unless requested.
   - implementation:
     - new `rwkv7_state_scan_prep_n64_rowgroup_kernel` keeps the same narrow
       fp16 / `head_dim=64` / shared-state CUDA scaffold but assigns multiple
@@ -395,12 +395,57 @@ Branch: `wangyue/native-prefill-060-albatross`
     block-wide synchronization around shared state. Keep it disabled by
     default. The next CUDA step must change the state layout / persistent
     schedule rather than only increasing row parallelism.
+- [x] Try row-block register-state CUDA layout inside the dedicated CUDA
+  scaffold:
+  - added `RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES=64` as a separate
+    row-block layout experiment. The prior lanes `1/2/4/8/16` rowgroup paths
+    remain unchanged.
+  - implementation:
+    - new `rwkv7_state_scan_prep_n64_rowblock_kernel` launches one CUDA block
+      per `(batch, head, state_row)` for the narrow fp16 / `head_dim=64`
+      prototype.
+    - each row keeps its `state[row, col]` element in a register across the
+      whole sequence and only writes the final state at the end, avoiding the
+      full `[64,64]` shared-state layout used by the first CUDA scaffold.
+    - the first row-block version used serial thread-0 reductions; the followup
+      version adds warp-shuffle block reductions for the row dot products.
+  - validation result files:
+    - `bench/results_4090_prefill060_cuda_state_scan_rowblock_smoke_20260702_170519.jsonl`
+    - `bench/results_4090_prefill060_cuda_state_scan_rowblock_confirm_20260702_170620.jsonl`
+    - `bench/results_4090_prefill060_cuda_state_scan_rowblock_reduce_smoke_20260702_170948.jsonl`
+    - `bench/results_4090_prefill060_cuda_state_scan_rowblock_reduce_confirm_20260702_171050.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_cuda_state_scan_rowblock_smoke_20260702_170519.jsonl`
+    - `/tmp/native_4090_cuda_state_scan_rowblock_confirm_20260702_170620.jsonl`
+    - `/tmp/native_4090_cuda_state_scan_rowblock_reduce_smoke_20260702_170948.jsonl`
+    - `/tmp/native_4090_cuda_state_scan_rowblock_reduce_confirm_20260702_171050.jsonl`
+  - rows all pass greedy/cache smoke:
+    - first row-block smoke: `25,361.2 tok/s` versus same-run CUDA lanes=1
+      baseline `24,966.5 tok/s`.
+    - first row-block confirm: `25,053.1 tok/s` versus same-run baseline
+      `26,217.6 tok/s`.
+    - warp-shuffle row-block smoke: `26,600.9 tok/s` versus same-run baseline
+      `25,489.0 tok/s`.
+    - warp-shuffle row-block confirm: `26,069.7 tok/s` versus same-run
+      baseline `26,184.1 tok/s`, max diff `0.09375`.
+  - conclusion: the register-state row-block rewrite is much more promising
+    than the shared-state rowgroup CUDA scaffold and reaches near-parity with
+    the current Triton path in a corrected 4090 harness, but confirmation still
+    does not beat the Triton baseline and remains below the `0.60x` Albatross
+    stretch target. Keep it opt-in. The next useful CUDA step is to remove
+    duplicated vector prep / K normalization across the 64 row blocks, e.g.
+    split into a head-level vector-precompute stage plus register-row apply, or
+    move to a cooperative persistent head-level schedule.
 - [ ] Next corrected-harness experiment:
-  - CUDA rowgroup testing narrowed the remaining credible path further: target
-    a persistent or layout-rewritten state scan that reduces per-token
-    `__syncthreads()` and shared-memory traffic, or a deeper Albatross/RWKV-LM
-    style CUDA scan. Do not promote wrapper/projection fusion or the current
-    rowgroup CUDA scaffold.
+  - CUDA rowgroup and row-block testing narrowed the remaining credible path:
+    target a persistent or layout-rewritten state scan that reduces per-token
+    synchronization/shared-memory traffic without recomputing W/K/V/A prep and
+    K normalization 64 times. The most concrete next experiment is a two-stage
+    CUDA path: head-level vector precompute once per `(B,H,T)` plus
+    register-row apply/output, or a cooperative persistent head-level schedule
+    that shares vector prep while keeping row state in registers. Do not
+    promote wrapper/projection fusion or the current rowgroup/row-block CUDA
+    scaffolds.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of

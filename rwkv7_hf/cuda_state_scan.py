@@ -328,6 +328,109 @@ __global__ void rwkv7_state_scan_prep_n64_rowgroup_kernel(
   }
 }
 
+__device__ __forceinline__ float rwkv7_block_reduce_sum_64(float value, float* scratch) {
+  const unsigned mask = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(mask, value, offset);
+  }
+  if (lane == 0) {
+    scratch[warp] = value;
+  }
+  __syncthreads();
+  value = threadIdx.x < 2 ? scratch[lane] : 0.0f;
+  if (warp == 0) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      value += __shfl_down_sync(mask, value, offset);
+    }
+  }
+  if (threadIdx.x == 0) {
+    scratch[0] = value;
+  }
+  __syncthreads();
+  return scratch[0];
+}
+
+template <typename scalar_t>
+__global__ void rwkv7_state_scan_prep_n64_rowblock_kernel(
+    const scalar_t* __restrict__ r,
+    const scalar_t* __restrict__ w_raw,
+    const scalar_t* __restrict__ k_raw,
+    const scalar_t* __restrict__ v_raw,
+    const scalar_t* __restrict__ a,
+    const float* __restrict__ state,
+    const scalar_t* __restrict__ k_k,
+    const scalar_t* __restrict__ k_a,
+    const scalar_t* __restrict__ v_first,
+    const scalar_t* __restrict__ v_gate,
+    scalar_t* __restrict__ out,
+    float* __restrict__ final_state,
+    scalar_t* __restrict__ k_out,
+    scalar_t* __restrict__ v_out,
+    int B,
+    int T,
+    int H,
+    bool has_v_gate) {
+  constexpr int N = 64;
+  const int block = blockIdx.x;
+  const int row = block % N;
+  const int bh = block / N;
+  const int head = bh % H;
+  const int batch = bh / H;
+  const int col = threadIdx.x;
+
+  __shared__ float partial[N];
+  __shared__ float v_row_s;
+
+  const int state_base = (batch * H + head) * N * N;
+  const int param_base = head * N;
+  float st = state[state_base + row * N + col];
+
+  for (int t = 0; t < T; ++t) {
+    const int vec_base = ((batch * T + t) * H + head) * N;
+    const float rv = static_cast<float>(r[vec_base + col]);
+    const float wr = static_cast<float>(w_raw[vec_base + col]);
+    const float kr = static_cast<float>(k_raw[vec_base + col]);
+    const float av = static_cast<float>(a[vec_base + col]);
+    const float kk_raw = kr * static_cast<float>(k_k[param_base + col]);
+    const float wv = __expf(-0.606531f / (1.0f + __expf(-wr)));
+    const float kv = kr * (1.0f + (av - 1.0f) * static_cast<float>(k_a[param_base + col]));
+
+    if (threadIdx.x == 0) {
+      const float vr = static_cast<float>(v_raw[vec_base + row]);
+      if (has_v_gate) {
+        const float vf = static_cast<float>(v_first[vec_base + row]);
+        const float vg = static_cast<float>(v_gate[vec_base + row]);
+        v_row_s = vr + (vf - vr) * vg;
+      } else {
+        v_row_s = vr;
+      }
+      v_out[vec_base + row] = static_cast<scalar_t>(v_row_s);
+    }
+    if (row == 0) {
+      k_out[vec_base + col] = static_cast<scalar_t>(kv);
+    }
+
+    const float norm2 = rwkv7_block_reduce_sum_64(kk_raw * kk_raw, partial);
+    const float norm_inv = rsqrtf(fmaxf(norm2, 1.0e-20f));
+    const float kk = kk_raw * norm_inv;
+    const float state_dot_kk = rwkv7_block_reduce_sum_64(st * kk, partial);
+
+    const float new_st = st * wv + v_row_s * kv - state_dot_kk * kk * av;
+    st = new_st;
+    const float recurrent = rwkv7_block_reduce_sum_64(new_st * rv, partial);
+    if (threadIdx.x == 0) {
+      out[vec_base + row] = static_cast<scalar_t>(recurrent);
+    }
+    __syncthreads();
+  }
+
+  final_state[state_base + row * N + col] = st;
+}
+
 std::vector<torch::Tensor> rwkv7_state_scan_prep_forward_cuda(
     torch::Tensor r,
     torch::Tensor w_raw,
@@ -369,8 +472,8 @@ std::vector<torch::Tensor> rwkv7_state_scan_prep_forward_cuda(
               k_k.scalar_type() == r.scalar_type() && k_a.scalar_type() == r.scalar_type(),
               "all vector inputs must match r dtype");
   TORCH_CHECK(lanes_per_row == 1 || lanes_per_row == 2 || lanes_per_row == 4 ||
-              lanes_per_row == 8 || lanes_per_row == 16,
-              "CUDA prototype lanes_per_row must be one of 1, 2, 4, 8, or 16");
+              lanes_per_row == 8 || lanes_per_row == 16 || lanes_per_row == 64,
+              "CUDA prototype lanes_per_row must be one of 1, 2, 4, 8, 16, or 64");
 
   auto out = torch::empty_like(r);
   auto final_state = torch::empty_like(state);
@@ -379,7 +482,26 @@ std::vector<torch::Tensor> rwkv7_state_scan_prep_forward_cuda(
 
   auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(B * H);
-  if (lanes_per_row == 2) {
+  if (lanes_per_row == 64) {
+    const dim3 row_grid(B * H * 64);
+    const dim3 block(64);
+    rwkv7_state_scan_prep_n64_rowblock_kernel<at::Half><<<row_grid, block, 0, stream>>>(
+        r.data_ptr<at::Half>(),
+        w_raw.data_ptr<at::Half>(),
+        k_raw.data_ptr<at::Half>(),
+        v_raw.data_ptr<at::Half>(),
+        a.data_ptr<at::Half>(),
+        state.data_ptr<float>(),
+        k_k.data_ptr<at::Half>(),
+        k_a.data_ptr<at::Half>(),
+        has_v_gate ? v_first.data_ptr<at::Half>() : v_raw.data_ptr<at::Half>(),
+        has_v_gate ? v_gate.data_ptr<at::Half>() : v_raw.data_ptr<at::Half>(),
+        out.data_ptr<at::Half>(),
+        final_state.data_ptr<float>(),
+        k_out.data_ptr<at::Half>(),
+        v_out.data_ptr<at::Half>(),
+        B, T, H, has_v_gate);
+  } else if (lanes_per_row == 2) {
     const dim3 block(64 * 2);
     rwkv7_state_scan_prep_n64_rowgroup_kernel<at::Half, 2><<<grid, block, 0, stream>>>(
         r.data_ptr<at::Half>(),
@@ -483,7 +605,7 @@ def _load_extension():
     from torch.utils.cpp_extension import load_inline
 
     return load_inline(
-        name="rwkv7_cuda_state_scan_v3",
+        name="rwkv7_cuda_state_scan_v5",
         cpp_sources=_CPP_SRC,
         cuda_sources=_CUDA_SRC,
         functions=["state_scan_prep_forward"],
@@ -534,8 +656,8 @@ def cuda_state_scan_prep(
             lanes_per_row = int(os.environ.get("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES", "1"))
         except ValueError:
             lanes_per_row = 1
-    if int(lanes_per_row) not in {1, 2, 4, 8, 16}:
-        raise ValueError("cuda_state_scan_prep lanes_per_row must be one of 1, 2, 4, 8, or 16")
+    if int(lanes_per_row) not in {1, 2, 4, 8, 16, 64}:
+        raise ValueError("cuda_state_scan_prep lanes_per_row must be one of 1, 2, 4, 8, 16, or 64")
     ext = _load_extension()
     out, final_state, k_out, v_out = ext.state_scan_prep_forward(
         r.contiguous(),

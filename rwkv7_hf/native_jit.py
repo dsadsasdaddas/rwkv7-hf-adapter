@@ -377,9 +377,9 @@ def _native_prefill_cuda_state_scan_enabled() -> bool:
 def _native_prefill_cuda_state_scan_lanes_per_row() -> int:
     """Per-row CUDA parallelism for the experimental N=64 state-scan."""
 
-    value = env_int("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES", 1, lower=1, upper=16)
-    if value not in {1, 2, 4, 8, 16}:
-        raise ValueError("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES must be one of 1, 2, 4, 8, or 16")
+    value = env_int("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES", 1, lower=1, upper=64)
+    if value not in {1, 2, 4, 8, 16, 64}:
+        raise ValueError("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_LANES must be one of 1, 2, 4, 8, 16, or 64")
     return value
 
 
