@@ -1276,51 +1276,80 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             f"fused backend prefill P1 pending: prefill min {albatross_prefill_min:.2f}x Albatross; "
             "plan scan/chunk fused prefill path"
         )
+    required_training_backends = {"trainer", "trl_sft", "trl_dpo", "trl_grpo"}
     training_pass = [r for r in training_latest if r.get("status") == "pass"]
-    training_backends = {r.get("trainer_backend") for r in training_pass}
-    missing_training = sorted({"trainer", "trl_sft", "trl_dpo", "trl_grpo"} - training_backends)
-    if missing_training:
+    training_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in training_latest:
+        training_by_model[model_label(row)].append(row)
+    if not training_by_model:
+        missing_training = sorted(required_training_backends)
         focus.append(f"training smoke telemetry incomplete: missing {missing_training}")
     else:
+        incomplete_training = False
+        for label, model_rows in sorted(training_by_model.items()):
+            passed_backends = {
+                row.get("trainer_backend")
+                for row in model_rows
+                if row.get("status") == "pass"
+            }
+            missing_training = sorted(required_training_backends - passed_backends)
+            if missing_training:
+                incomplete_training = True
+                focus.append(f"training smoke telemetry incomplete for {label}: missing {missing_training}")
+        if not incomplete_training:
+            min_delta = min(float(r.get("max_trainable_delta") or 0.0) for r in training_pass)
+            focus.append(
+                "HF training telemetry passes for Trainer/SFT/DPO/GRPO "
+                f"with min trainable delta {min_delta:.3g}"
+            )
+    if training_pass and not any(item.startswith("HF training telemetry passes") for item in focus):
         min_delta = min(float(r.get("max_trainable_delta") or 0.0) for r in training_pass)
         focus.append(
-            "HF training telemetry passes for Trainer/SFT/DPO/GRPO "
+            "HF training telemetry has passing rows "
             f"with min trainable delta {min_delta:.3g}"
         )
     for row in training_latest:
         if row.get("status") == "pass" and float(row.get("max_trainable_delta") or 0.0) <= 0.0:
             focus.append(f"training smoke did not update trainable params: {model_label(row)} {row.get('trainer_backend')}")
-    deepspeed_stages = {
-        int(r.get("zero_stage"))
-        for r in deepspeed_latest
-        if r.get("zero_stage") is not None
-    }
-    missing_zero = sorted({2, 3} - deepspeed_stages)
-    if missing_zero:
+    required_zero_stages = {2, 3}
+    deepspeed_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in deepspeed_latest:
+        deepspeed_by_model[model_label(row)].append(row)
+    if not deepspeed_by_model:
+        missing_zero = sorted(required_zero_stages)
         focus.append(f"DeepSpeed ZeRO smoke telemetry incomplete: missing stages {missing_zero}")
     else:
-        passed_zero = sorted({
-            int(row.get("zero_stage"))
-            for row in deepspeed_latest
-            if row.get("status") == "pass" and row.get("zero_stage") is not None
-        })
-        skipped_zero = sorted({
-            int(row.get("zero_stage"))
-            for row in deepspeed_latest
-            if row.get("status") == "skip" and row.get("zero_stage") is not None
-        })
-        if passed_zero:
-            focus.append(f"DeepSpeed ZeRO smoke passes for stages {passed_zero}")
-        if skipped_zero:
-            reasons = {
-                stage: sorted({
-                    str(row.get("reason"))
-                    for row in deepspeed_latest
-                    if row.get("zero_stage") == stage and row.get("status") == "skip"
-                })
-                for stage in skipped_zero
+        for label, model_rows in sorted(deepspeed_by_model.items()):
+            deepspeed_stages = {
+                int(row.get("zero_stage"))
+                for row in model_rows
+                if row.get("zero_stage") is not None
             }
-            focus.append(f"DeepSpeed ZeRO smoke skipped for stages {skipped_zero}: {reasons}")
+            missing_zero = sorted(required_zero_stages - deepspeed_stages)
+            if missing_zero:
+                focus.append(f"DeepSpeed ZeRO smoke telemetry incomplete for {label}: missing stages {missing_zero}")
+            passed_zero = sorted({
+                int(row.get("zero_stage"))
+                for row in model_rows
+                if row.get("status") == "pass" and row.get("zero_stage") is not None
+            })
+            skipped_zero = sorted({
+                int(row.get("zero_stage"))
+                for row in model_rows
+                if row.get("status") == "skip" and row.get("zero_stage") is not None
+            })
+            if passed_zero:
+                focus.append(f"DeepSpeed ZeRO smoke passes for stages {passed_zero} for {label}")
+            if skipped_zero:
+                reasons = {
+                    stage: sorted({
+                        str(row.get("reason"))
+                        for row in model_rows
+                        if row.get("zero_stage") == stage and row.get("status") == "skip"
+                    })
+                    for stage in skipped_zero
+                }
+                focus.append(f"DeepSpeed ZeRO smoke skipped for stages {skipped_zero} for {label}: {reasons}")
         for row in deepspeed_latest:
             stage = row.get("zero_stage")
             if stage is not None and row.get("status") == "pass" and float(row.get("max_trainable_delta") or 0.0) <= 0.0:

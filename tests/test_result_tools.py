@@ -2598,6 +2598,106 @@ def assert_model_aware_focus_checks_do_not_overwrite_deepspeed_rows(tmpdir: Path
     )
 
 
+def assert_model_aware_focus_checks_report_missing_backends_per_model(tmpdir: Path) -> None:
+    rows = []
+    for label, backends in (
+        ("0.1b", ("trainer", "trl_sft", "trl_dpo", "trl_grpo")),
+        ("0.4b", ("trainer", "trl_sft", "trl_dpo")),
+    ):
+        for backend in backends:
+            rows.append(
+                {
+                    "axis": "training_smoke",
+                    "backend": "hf_adapter",
+                    "trainer_backend": backend,
+                    "status": "pass",
+                    "model_size_label": label,
+                    "model_name": f"rwkv7-{label}-hf",
+                    "hf_model_dir": f"/models/rwkv7-{label}-hf",
+                    "dtype": "bf16",
+                    "train_dtype": "bf16",
+                    "device": "NVIDIA A100-PCIE-40GB",
+                    "attn_mode": "fused_recurrent",
+                    "batch_size": 1,
+                    "gradient_accumulation_steps": 1,
+                    "effective_batch_size": 1,
+                    "max_steps": 1,
+                    "train_loss": 1.0,
+                    "train_runtime_s": 1.0,
+                    "train_samples_per_second": 1.0,
+                    "train_steps_per_second": 1.0,
+                    "max_trainable_delta": 1e-4,
+                }
+            )
+    for label, stages in (("0.1b", (2, 3)), ("0.4b", (2,))):
+        for stage in stages:
+            rows.append(
+                {
+                    "axis": "deepspeed_training_smoke",
+                    "backend": "hf_adapter",
+                    "trainer_backend": f"trainer_zero{stage}",
+                    "zero_stage": stage,
+                    "status": "pass",
+                    "model_size_label": label,
+                    "model_name": f"rwkv7-{label}-hf",
+                    "hf_model_dir": f"/models/rwkv7-{label}-hf",
+                    "dtype": "bf16",
+                    "train_dtype": "bf16",
+                    "device": "NVIDIA A100-PCIE-40GB",
+                    "cuda_device_count": 2,
+                    "attn_mode": "fused_recurrent",
+                    "batch_size": 1,
+                    "gradient_accumulation_steps": 1,
+                    "effective_batch_size": 1,
+                    "max_steps": 1,
+                    "deepspeed_config": f"configs/deepspeed/zero{stage}.json",
+                    "train_loss": 1.0,
+                    "train_runtime_s": 1.0,
+                    "train_samples_per_second": 1.0,
+                    "train_steps_per_second": 1.0,
+                    "max_trainable_delta": 1e-4,
+                }
+            )
+
+    path = tmpdir / "model_aware_missing_backend_results.jsonl"
+    write_jsonl(path, rows)
+    analyzed = subprocess.run(
+        [
+            sys.executable,
+            "bench/analyze_results.py",
+            "--results",
+            str(path),
+            "--device",
+            "A100",
+            "--dtype",
+            "fp16",
+            "--json",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert analyzed.returncode == 0, analyzed.stdout + analyzed.stderr
+    report = json.loads(analyzed.stdout)
+    assert any(
+        "training smoke telemetry incomplete for 0.4b: missing ['trl_grpo']" in item
+        for item in report["next_focus"]
+    )
+    assert not any(
+        "training smoke telemetry incomplete for 0.1b" in item
+        for item in report["next_focus"]
+    )
+    assert any(
+        "DeepSpeed ZeRO smoke telemetry incomplete for 0.4b: missing stages [3]" in item
+        for item in report["next_focus"]
+    )
+    assert not any(
+        "DeepSpeed ZeRO smoke telemetry incomplete for 0.1b" in item
+        for item in report["next_focus"]
+    )
+
+
 def main() -> int:
     rows = [
         {
@@ -2718,6 +2818,7 @@ def main() -> int:
         assert_checkpoint_resume_smoke_survives_inference_dtype_filter(tmpdir)
         assert_deepspeed_resume_smoke_survives_inference_dtype_filter(tmpdir)
         assert_model_aware_focus_checks_do_not_overwrite_deepspeed_rows(tmpdir)
+        assert_model_aware_focus_checks_report_missing_backends_per_model(tmpdir)
     args = argparse.Namespace(device="V100", dtype="fp16")
     speeds = latest_by_layout(fast_speed_rows(loaded, args))
     micros = latest_by_layout(fast_micro_rows(loaded, args))
