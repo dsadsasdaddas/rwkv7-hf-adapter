@@ -80,6 +80,7 @@ __all__ = [
     "dplr_dense_chunk_apply_output_triton",
     "dplr_dense_three_stage_triton",
     "dplr_compact_wy_three_stage_triton",
+    "dplr_compact_wy_recompute_apply_output_triton",
 ]
 
 
@@ -523,6 +524,119 @@ if _HAS_TRITON:
             recurrent = tl.sum(st * r[None, :], axis=1)
             tl.store(out_ptr + vec_base + offs_i, recurrent, mask=mask_i)
             local_i += 1
+
+    @triton.jit
+    def _compact_wy_recompute_apply_output_kernel(
+        r_ptr,
+        w_ptr,
+        k_ptr,
+        v_ptr,
+        kk_ptr,
+        a_ptr,
+        state_ptr,
+        diag_ptr,
+        trans_left_ptr,
+        trans_right_ptr,
+        add_left_ptr,
+        add_right_ptr,
+        out_ptr,
+        final_state_ptr,
+        T: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        CHUNKS: tl.constexpr,
+        C: tl.constexpr,
+        R: tl.constexpr,
+        ROW_BLOCKS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        """Apply compact-WY chunks without materializing dense start states.
+
+        Each program owns one `(batch, chunk, head, row_block)`.  It recomputes
+        the chunk start state from the compact prefix factors, applies the
+        token recurrence for that chunk, emits outputs, and writes only the
+        final chunk's state.  This deliberately trades duplicated prefix math
+        for removing the dense `start_states` write/read boundary.
+        """
+
+        pid = tl.program_id(0)
+        row_block = pid % ROW_BLOCKS
+        tmp = pid // ROW_BLOCKS
+        head_id = tmp % H
+        chunk_id = (tmp // H) % CHUNKS
+        batch_id = tmp // (H * CHUNKS)
+
+        offs_i = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_j = tl.arange(0, BLOCK_N)
+        offs_r = tl.arange(0, BLOCK_R)
+        mask_i = offs_i < N
+        mask_j = offs_j < N
+        mask_r = offs_r < R
+        row_mask = mask_i[:, None] & mask_j[None, :]
+
+        state_base = (batch_id * H + head_id) * N * N
+        cur = tl.load(
+            state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :],
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        prefix_chunk = 0
+        while prefix_chunk < CHUNKS:
+            summary_base = ((batch_id * CHUNKS + prefix_chunk) * H + head_id) * N
+            factor_base = summary_base * R
+
+            diag = tl.load(diag_ptr + summary_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            factor_mask = mask_j[:, None] & mask_r[None, :]
+            trans_left = tl.load(
+                trans_left_ptr + factor_base + offs_j[:, None] * R + offs_r[None, :],
+                mask=factor_mask,
+                other=0.0,
+            ).to(tl.float32)
+            trans_right = tl.load(
+                trans_right_ptr + factor_base + offs_j[:, None] * R + offs_r[None, :],
+                mask=factor_mask,
+                other=0.0,
+            ).to(tl.float32)
+            add_left = tl.load(
+                add_left_ptr + factor_base + offs_i[:, None] * R + offs_r[None, :],
+                mask=mask_i[:, None] & mask_r[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            add_right = tl.load(
+                add_right_ptr + factor_base + offs_j[:, None] * R + offs_r[None, :],
+                mask=factor_mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            trans_coeff = tl.dot(cur, trans_left, input_precision="ieee")
+            next_cur = cur * diag[None, :]
+            next_cur += tl.dot(trans_coeff, tl.trans(trans_right), input_precision="ieee")
+            next_cur += tl.dot(add_left, tl.trans(add_right), input_precision="ieee")
+            cur = tl.where(prefix_chunk < chunk_id, next_cur, cur)
+            prefix_chunk += 1
+
+        local_i = 0
+        while local_i < C:
+            t = chunk_id * C + local_i
+            vec_base = ((batch_id * T + t) * H + head_id) * N
+            r = tl.load(r_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            w = tl.load(w_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            key = tl.load(k_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            kk = tl.load(kk_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            a = tl.load(a_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+            v_rows = tl.load(v_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+
+            state_dot_kk = tl.sum(cur * kk[None, :], axis=1)
+            cur = cur * w[None, :] + v_rows[:, None] * key[None, :] - state_dot_kk[:, None] * kk[None, :] * a[None, :]
+            recurrent = tl.sum(cur * r[None, :], axis=1)
+            tl.store(out_ptr + vec_base + offs_i, recurrent, mask=mask_i)
+            local_i += 1
+
+        final_mask = row_mask & (chunk_id == CHUNKS - 1)
+        tl.store(final_state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :], cur, mask=final_mask)
 
 
 def dplr_chunk_scan_triton_available() -> bool:
@@ -1621,6 +1735,170 @@ def dplr_dense_chunk_apply_output_triton(
     return out
 
 
+def dplr_compact_wy_recompute_apply_output_triton(
+    r: Any,
+    w: Any,
+    k: Any,
+    v: Any,
+    kk: Any,
+    a: Any,
+    state: Any,
+    summary: dict[str, Any],
+    *,
+    chunk_size: int = 64,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    force_fallback: bool = False,
+):
+    """Compact-WY apply/output that recomputes chunk starts inside stage 3.
+
+    This is an opt-in experiment for reducing dense `start_states` traffic
+    without lowering precision.  It avoids storing/reading the dense
+    `[B,chunks,H,N,N]` starts, but duplicates compact prefix math per chunk.
+    """
+
+    if torch is None:
+        raise RuntimeError("dplr_compact_wy_recompute_apply_output_triton requires torch")
+    chunk_size_i = _validate_chunk_size(chunk_size)
+    if state.dim() != 4:
+        raise ValueError("state must be [B,H,N,N]")
+    B, H, N, N2 = (int(vv) for vv in state.shape)
+    if N != N2:
+        raise ValueError("state must be square in the last two dimensions")
+    diag = summary["transition_diag"]
+    trans_left = summary["transition_left"]
+    trans_right = summary["transition_right"]
+    add_left = summary["additive_left"]
+    add_right = summary["additive_right"]
+    if diag.dim() != 4 or trans_left.dim() != 5 or trans_right.dim() != 5 or add_left.dim() != 5 or add_right.dim() != 5:
+        raise ValueError("compact summary must be [B,chunks,H,N] plus [B,chunks,H,N,R] factors")
+    chunks = int(diag.shape[1])
+    R = int(trans_left.shape[-1])
+    if (
+        int(diag.shape[0]) != B
+        or int(diag.shape[2]) != H
+        or int(diag.shape[3]) != N
+        or int(trans_left.shape[0]) != B
+        or int(trans_left.shape[1]) != chunks
+        or int(trans_left.shape[2]) != H
+        or int(trans_left.shape[3]) != N
+        or tuple(trans_left.shape) != tuple(trans_right.shape)
+        or tuple(add_left.shape) != tuple(add_right.shape)
+    ):
+        raise ValueError("compact summary shapes must match state")
+
+    r4, flat = _as_bthn(r, H, N, name="r")
+    w4, _ = _as_bthn(w, H, N, name="w")
+    k4, _ = _as_bthn(k, H, N, name="k")
+    v4, _ = _as_bthn(v, H, N, name="v")
+    kk4, _ = _as_bthn(kk, H, N, name="kk")
+    a4, _ = _as_bthn(a, H, N, name="a")
+    T = int(r4.shape[1])
+    if T != chunks * chunk_size_i:
+        raise ValueError("tokens must equal chunks * chunk_size")
+    if block_m is None:
+        block_m = _env_int("RWKV7_DPLR_TRITON_RECOMPUTE_BLOCK_M", _env_int("RWKV7_DPLR_TRITON_APPLY_BLOCK_M", 8))
+    if block_n is None:
+        block_n = N
+    block_m = int(block_m)
+    block_n = int(block_n)
+    if block_m <= 0:
+        raise ValueError("block_m must be positive")
+    if block_n < N:
+        raise ValueError(f"block_n must be >= head_dim={N}; got {block_n}")
+
+    k_kernel = k4 if k4.dtype == r4.dtype else k4.to(dtype=r4.dtype)
+    v_kernel = v4 if v4.dtype == r4.dtype else v4.to(dtype=r4.dtype)
+    kk_kernel = kk4 if kk4.dtype == r4.dtype else kk4.to(dtype=r4.dtype)
+    a_kernel = a4 if a4.dtype == r4.dtype else a4.to(dtype=r4.dtype)
+    target_supported = 16 <= N <= 64 and 16 <= R <= 64 and block_n <= 64 and chunk_size_i <= 64
+    use_triton = (
+        not force_fallback
+        and target_supported
+        and _HAS_TRITON
+        and dplr_compact_wy_chunk_summary_triton_available()
+        and r4.is_cuda
+        and w4.is_cuda
+        and k_kernel.is_cuda
+        and v_kernel.is_cuda
+        and kk_kernel.is_cuda
+        and a_kernel.is_cuda
+        and state.is_cuda
+        and diag.is_cuda
+        and trans_left.is_cuda
+        and trans_right.is_cuda
+        and add_left.is_cuda
+        and add_right.is_cuda
+        and state.dtype == torch.float32
+        and r4.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and w4.dtype in (r4.dtype, torch.float32)
+    )
+    if not use_triton:
+        start_states, prefix_final = dplr_compact_wy_prefix_combine_triton(
+            state,
+            summary,
+            force_fallback=force_fallback,
+        )
+        out = dplr_dense_chunk_apply_output_triton(
+            r4.reshape(B, T, H * N) if flat else r4,
+            w4,
+            k4,
+            v4,
+            kk4,
+            a4,
+            start_states,
+            chunk_size=chunk_size_i,
+            force_fallback=force_fallback,
+        )
+        return out, prefix_final.to(dtype=state.dtype)
+
+    r_c = r4.contiguous()
+    w_c = w4.contiguous()
+    k_c = k_kernel.contiguous()
+    v_c = v_kernel.contiguous()
+    kk_c = kk_kernel.contiguous()
+    a_c = a_kernel.contiguous()
+    state_c = state.contiguous()
+    diag_c = diag.contiguous()
+    trans_left_c = trans_left.contiguous()
+    trans_right_c = trans_right.contiguous()
+    add_left_c = add_left.contiguous()
+    add_right_c = add_right.contiguous()
+    out = torch.empty((B, T, H, N), device=r4.device, dtype=r4.dtype)
+    final_state = torch.empty_like(state_c)
+    row_blocks = triton.cdiv(N, block_m)
+    _compact_wy_recompute_apply_output_kernel[(B * chunks * H * row_blocks,)](
+        r_c,
+        w_c,
+        k_c,
+        v_c,
+        kk_c,
+        a_c,
+        state_c,
+        diag_c,
+        trans_left_c,
+        trans_right_c,
+        add_left_c,
+        add_right_c,
+        out,
+        final_state,
+        T,
+        H,
+        N,
+        chunks,
+        chunk_size_i,
+        R,
+        ROW_BLOCKS=int(row_blocks),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_R=R,
+        num_warps=4 if block_m < N else 8,
+    )
+    if flat:
+        out = out.reshape(B, T, H * N)
+    return out, final_state
+
+
 def dplr_dense_three_stage_triton(
     r: Any,
     w: Any,
@@ -1684,6 +1962,7 @@ def dplr_compact_wy_three_stage_triton(
     chunk_size: int = 64,
     output_only: bool | None = None,
     start_dtype: Any | None = None,
+    recompute_starts: bool | None = None,
     force_fallback: bool = False,
 ):
     """Compact-WY three-stage DPLR scaffold.
@@ -1719,14 +1998,30 @@ def dplr_compact_wy_three_stage_triton(
         chunk_size=chunk_size,
         force_fallback=force_fallback,
     )
+    if recompute_starts is None:
+        recompute_starts = _env_flag("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", False)
+    if output_only is None:
+        output_only = _env_flag("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", False)
+    if recompute_starts:
+        return dplr_compact_wy_recompute_apply_output_triton(
+            r4.reshape(B, int(r4.shape[1]), H * N) if flat else r4,
+            w4,
+            k4,
+            v4,
+            kk4,
+            a4,
+            state,
+            summary,
+            chunk_size=chunk_size,
+            force_fallback=force_fallback,
+        )
+
     start_states, prefix_final = dplr_compact_wy_prefix_combine_triton(
         state,
         summary,
         start_dtype=start_dtype,
         force_fallback=force_fallback,
     )
-    if output_only is None:
-        output_only = _env_flag("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", False)
 
     if output_only:
         out = dplr_dense_chunk_apply_output_triton(

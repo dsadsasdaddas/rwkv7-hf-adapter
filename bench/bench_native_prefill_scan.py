@@ -256,6 +256,10 @@ def run_case(args: argparse.Namespace, tok, model, batch_size: int, prompt_token
         ),
         "prefill_dplr_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower()
         not in {"0", "false", "no", "off"},
+        "prefill_dplr_compact_recompute_starts": os.environ.get(
+            "RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0"
+        ).lower()
+        not in {"0", "false", "no", "off"},
         "prefill_fused_shift_mix_requested": os.environ.get("RWKV7_NATIVE_PREFILL_FUSED_SHIFT_MIX", "0").lower() not in {"0", "false", "no", "off"},
         "prefill_fused_shift_mix_effective": nj._native_prefill_fused_shift_mix_enabled(),
         "prefill_fused_state_prep_requested": os.environ.get("RWKV7_NATIVE_PREFILL_FUSED_STATE_PREP", "0").lower() not in {"0", "false", "no", "off"},

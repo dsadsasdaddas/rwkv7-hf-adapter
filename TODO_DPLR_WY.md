@@ -720,7 +720,7 @@ Branch: `wangyue/native-prefill-060-albatross`
       - conclusion: fp16 start states are correctness-safe and slightly reduce
         memory, but they do not speed the compact path on 4090 and should stay
         opt-in / not promoted.
-- [ ] Next compact-WY task:
+- [x] Next compact-WY task:
   - Do not spend another iteration on lossy `start_states` storage. The next
     useful compact experiment should reduce or bypass dense start-state traffic
     without adding lossy conversion, e.g. a compact-prefix/apply fusion that
@@ -729,6 +729,52 @@ Branch: `wangyue/native-prefill-060-albatross`
     chunk-level parallelism. Keep output-only apply as the best compact HF
     flag so far, but do not default-enable it until a same-run synthetic/HF
     confirmation beats the current fused recurrent scan line.
+  - Done: added opt-in compact recompute-starts apply/output fusion:
+    `RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS=1`.
+    - implementation:
+      - new `dplr_compact_wy_recompute_apply_output_triton(...)` launches the
+        apply/output stage per `(batch, chunk, head, row_block)` and
+        recomputes each chunk's dense start state from compact WY prefix
+        factors inside the kernel;
+      - this avoids global dense `start_states` materialization/readback and
+        writes only the final state's last chunk, preserving fp32 start-state
+        math instead of using lossy fp16 starts;
+      - stage probe now records `compact3_recompute_starts_full`; HF telemetry
+        records `prefill_dplr_compact_recompute_starts`.
+    - result files:
+      - stage probe:
+        `bench/results_4090_prefill060_dplr_compact_recompute_starts_stage_20260703_044500.jsonl`
+      - synthetic algorithm confirm:
+        `bench/results_4090_prefill060_dplr_compact_recompute_starts_confirm_20260703_043500.jsonl`
+      - HF corrected smoke:
+        `bench/results_4090_prefill060_native_dplr_compact_recompute_starts_20260703_043000.jsonl`
+    - 4090 synthetic, `B=1,T=512,H=16,N=64,chunk=64,fp16`:
+      - correctness passes, `out_min_cosine=0.99999988`,
+        `state_max_abs_diff=0.0001257`;
+      - normal compact full in the same stage probe: `0.22799 ms`;
+      - output-only compact full: `0.22986 ms`;
+      - recompute-starts full: `0.50250 ms`;
+      - algorithm confirm with env flag: `0.63908 ms`.
+      - conclusion: recomputing starts removes the dense start-state traffic
+        but duplicates too much compact prefix math for synthetic throughput.
+    - 4090 HF corrected smoke, 0.4B / prompt512 / bsz1:
+      - same-run output-only compact baseline: pass, `17,696.9 tok/s`,
+        `28.9316 ms`, peak `996.2 MiB`;
+      - recompute-starts compact: pass, `18,620.9 tok/s`, `27.4960 ms`,
+        peak `994.2 MiB`;
+      - conclusion: the non-lossy recompute route is mildly better in full HF
+        than the same-run output-only compact row and saves a little memory,
+        but it is still far below the main fused recurrent scan line and is
+        strongly negative on synthetic. Keep it opt-in; do not promote.
+- [ ] Next compact-WY task:
+  - Stop testing duplicated-prefix variants at the current chunk count. The
+    useful next compact experiment should preserve the prefix-combine work
+    efficiency while reducing dense start-state traffic, e.g. store a smaller
+    prefix representation or add a true segmented/persistent prefix+apply
+    schedule that shares compact prefix work across chunks without lossy
+    starts. If that is too large for one turn, first add a micro/probe that
+    estimates how much of recompute-starts time is duplicated prefix vs token
+    apply so the next kernel boundary is chosen from evidence.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of

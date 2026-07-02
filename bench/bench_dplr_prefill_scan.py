@@ -565,6 +565,7 @@ def emit_compact_stage_probe(
     dplr_compact_wy_chunk_summary_triton: Callable[..., Any] | None,
     dplr_compact_wy_prefix_combine_torch: Callable[..., Any] | None,
     dplr_compact_wy_prefix_combine_triton: Callable[..., Any] | None,
+    dplr_compact_wy_recompute_apply_output_triton: Callable[..., Any] | None,
     dplr_dense_chunk_apply_torch: Callable[..., Any] | None,
     dplr_dense_chunk_apply_triton: Callable[..., Any] | None,
     dplr_dense_chunk_apply_output_triton: Callable[..., Any] | None,
@@ -585,6 +586,7 @@ def emit_compact_stage_probe(
         "compact_chunk_apply_output_only",
         "compact3_full",
         "compact3_output_only_full",
+        "compact3_recompute_starts_full",
     )
     required = (
         dplr_compact_wy_apply_summaries_torch,
@@ -592,6 +594,7 @@ def emit_compact_stage_probe(
         dplr_compact_wy_chunk_summary_triton,
         dplr_compact_wy_prefix_combine_torch,
         dplr_compact_wy_prefix_combine_triton,
+        dplr_compact_wy_recompute_apply_output_triton,
         dplr_dense_chunk_apply_torch,
         dplr_dense_chunk_apply_triton,
         dplr_dense_chunk_apply_output_triton,
@@ -618,7 +621,9 @@ def emit_compact_stage_probe(
                 "triton_compact_start_state_dtype": os.environ.get(
                     "RWKV7_DPLR_TRITON_COMPACT_START_STATE_DTYPE", "fp32"
                 ),
-                "compact_output_only": stage in {"compact_chunk_apply_output_only", "compact3_output_only_full"},
+                "compact_output_only": stage
+                in {"compact_chunk_apply_output_only", "compact3_output_only_full", "compact3_recompute_starts_full"},
+                "compact_recompute_starts": stage == "compact3_recompute_starts_full",
             }
         )
         return row
@@ -675,7 +680,15 @@ def emit_compact_stage_probe(
                 xs["r"], xs["w"], xs["k"], xs["v"], xs["kk"], xs["a"], starts_got, chunk_size=int(chunk_size)
             )
             compact3_got = dplr_compact_wy_three_stage_triton(  # type: ignore[misc]
-                xs["r"], xs["w"], xs["k"], xs["v"], xs["kk"], xs["a"], xs["state"], chunk_size=int(chunk_size)
+                xs["r"],
+                xs["w"],
+                xs["k"],
+                xs["v"],
+                xs["kk"],
+                xs["a"],
+                xs["state"],
+                chunk_size=int(chunk_size),
+                recompute_starts=False,
             )
             compact3_output_got = dplr_compact_wy_three_stage_triton(  # type: ignore[misc]
                 xs["r"],
@@ -687,6 +700,18 @@ def emit_compact_stage_probe(
                 xs["state"],
                 chunk_size=int(chunk_size),
                 output_only=True,
+                recompute_starts=False,
+            )
+            recompute_got = dplr_compact_wy_recompute_apply_output_triton(  # type: ignore[misc]
+                xs["r"],
+                xs["w"],
+                xs["k"],
+                xs["v"],
+                xs["kk"],
+                xs["a"],
+                xs["state"],
+                summary_got,
+                chunk_size=int(chunk_size),
             )
 
         summary_ms = timed(
@@ -721,7 +746,15 @@ def emit_compact_stage_probe(
         )
         full_ms = timed(
             lambda: dplr_compact_wy_three_stage_triton(  # type: ignore[misc]
-                xs["r"], xs["w"], xs["k"], xs["v"], xs["kk"], xs["a"], xs["state"], chunk_size=int(chunk_size)
+                xs["r"],
+                xs["w"],
+                xs["k"],
+                xs["v"],
+                xs["kk"],
+                xs["a"],
+                xs["state"],
+                chunk_size=int(chunk_size),
+                recompute_starts=False,
             ),
             device=args.device,
             warmup=args.warmup,
@@ -738,6 +771,23 @@ def emit_compact_stage_probe(
                 xs["state"],
                 chunk_size=int(chunk_size),
                 output_only=True,
+                recompute_starts=False,
+            ),
+            device=args.device,
+            warmup=args.warmup,
+            steps=args.steps,
+        )
+        recompute_ms = timed(
+            lambda: dplr_compact_wy_recompute_apply_output_triton(  # type: ignore[misc]
+                xs["r"],
+                xs["w"],
+                xs["k"],
+                xs["v"],
+                xs["kk"],
+                xs["a"],
+                xs["state"],
+                summary_got,
+                chunk_size=int(chunk_size),
             ),
             device=args.device,
             warmup=args.warmup,
@@ -755,6 +805,7 @@ def emit_compact_stage_probe(
         output_only_pair_diff = pair_diff((out_only_got, prefix_final_got), ref)
         full_pair_diff = pair_diff(compact3_got, ref)
         full_output_pair_diff = pair_diff(compact3_output_got, ref)
+        recompute_pair_diff = pair_diff(recompute_got, ref)
 
         row = make_stage_row("compact_chunk_summary")
         row.update(
@@ -837,6 +888,18 @@ def emit_compact_stage_probe(
             }
         )
         finish_timing_row(row, B=B, T=T, ms=full_output_ms)
+        emit_stage(row)
+
+        row = make_stage_row("compact3_recompute_starts_full")
+        row.update(
+            {
+                "status": "pass",
+                "state_source": "recomputed_last_chunk",
+                "peak_vram_mb": _peak_mb(args.device),
+                **recompute_pair_diff,
+            }
+        )
+        finish_timing_row(row, B=B, T=T, ms=recompute_ms)
         emit_stage(row)
     except Exception as exc:
         for stage in stages:
@@ -1125,6 +1188,7 @@ def main() -> int:
             dplr_compact_wy_prefix_combine_torch,
             dplr_compact_wy_prefix_combine_triton,
             dplr_compact_wy_prefix_combine_triton_available,
+            dplr_compact_wy_recompute_apply_output_triton,
             dplr_compact_wy_three_stage_triton,
             dplr_dense_chunk_apply_output_triton,
             dplr_dense_chunk_apply_torch,
@@ -1145,6 +1209,7 @@ def main() -> int:
         dplr_compact_wy_prefix_combine_torch = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_combine_triton = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_combine_triton_available = None  # type: ignore[assignment]
+        dplr_compact_wy_recompute_apply_output_triton = None  # type: ignore[assignment]
         dplr_compact_wy_three_stage_triton = None  # type: ignore[assignment]
         dplr_dense_chunk_apply_output_triton = None  # type: ignore[assignment]
         dplr_dense_chunk_apply_torch = None  # type: ignore[assignment]
@@ -1383,6 +1448,7 @@ def main() -> int:
                         dplr_compact_wy_chunk_summary_triton=dplr_compact_wy_chunk_summary_triton,
                         dplr_compact_wy_prefix_combine_torch=dplr_compact_wy_prefix_combine_torch,
                         dplr_compact_wy_prefix_combine_triton=dplr_compact_wy_prefix_combine_triton,
+                        dplr_compact_wy_recompute_apply_output_triton=dplr_compact_wy_recompute_apply_output_triton,
                         dplr_dense_chunk_apply_torch=dplr_dense_chunk_apply_torch,
                         dplr_dense_chunk_apply_triton=dplr_dense_chunk_apply_triton,
                         dplr_dense_chunk_apply_output_triton=dplr_dense_chunk_apply_output_triton,
@@ -1430,6 +1496,7 @@ def main() -> int:
                                 "triton_compact_prefix_block_m": int(os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_BLOCK_M", "8")) if (row.get("algorithm_family") == "triton_wy_compact") else None,
                                 "triton_compact_start_state_dtype": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_START_STATE_DTYPE", "fp32") if (row.get("algorithm_family") == "triton_wy_compact") else None,
                                 "triton_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower() not in {"0", "false", "no", "off"} if (row.get("algorithm_family") == "triton_wy_compact") else None,
+                                "triton_compact_recompute_starts": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0").lower() not in {"0", "false", "no", "off"} if (row.get("algorithm_family") == "triton_wy_compact") else None,
                                 "peak_vram_mb": _peak_mb(args.device),
                             }
                         )
@@ -1459,6 +1526,7 @@ def main() -> int:
                                 "triton_compact_prefix_block_m": int(os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_BLOCK_M", "8")) if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_start_state_dtype": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_START_STATE_DTYPE", "fp32") if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
+                                "triton_compact_recompute_starts": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "ms": None,
                                 "tokps": None,
                                 "out_max_abs_diff": None,
@@ -1484,6 +1552,7 @@ def main() -> int:
                                 "triton_compact_prefix_block_m": int(os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_BLOCK_M", "8")) if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_start_state_dtype": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_START_STATE_DTYPE", "fp32") if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
+                                "triton_compact_recompute_starts": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "ms": None,
                                 "tokps": None,
                                 "out_max_abs_diff": None,
