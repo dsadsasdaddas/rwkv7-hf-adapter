@@ -82,6 +82,7 @@ __all__ = [
     "dplr_compact_wy_three_stage_triton",
     "dplr_compact_wy_recompute_apply_output_triton",
     "dplr_compact_wy_recompute_phase_probe_triton",
+    "dplr_compact_wy_prefix_shared_apply_output_triton",
 ]
 
 
@@ -760,6 +761,78 @@ if _HAS_TRITON:
 
             final_mask = row_mask & (chunk_id == CHUNKS - 1)
             tl.store(final_state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :], cur, mask=final_mask)
+
+    @triton.jit
+    def _compact_wy_prefix_shared_apply_output_kernel(
+        r_ptr,
+        w_ptr,
+        k_ptr,
+        v_ptr,
+        kk_ptr,
+        a_ptr,
+        state_ptr,
+        out_ptr,
+        final_state_ptr,
+        T: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        CHUNKS: tl.constexpr,
+        C: tl.constexpr,
+        ROW_BLOCKS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Prefix-shared compact-WY apply/output schedule probe.
+
+        One program owns one `(batch, head, row_block)` and walks chunks
+        serially.  The state at each chunk boundary is computed exactly once
+        and immediately consumed by the token-apply loop, so no dense
+        `start_states` tensor is materialized and no prefix is recomputed per
+        chunk.  This intentionally gives up chunk-level parallelism; stage
+        benchmarks use it to quantify that tradeoff before attempting a more
+        complex persistent/segmented producer-consumer schedule.
+        """
+
+        pid = tl.program_id(0)
+        row_block = pid % ROW_BLOCKS
+        bh_id = pid // ROW_BLOCKS
+        head_id = bh_id % H
+        batch_id = bh_id // H
+
+        offs_i = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_j = tl.arange(0, BLOCK_N)
+        mask_i = offs_i < N
+        mask_j = offs_j < N
+        row_mask = mask_i[:, None] & mask_j[None, :]
+
+        state_base = (batch_id * H + head_id) * N * N
+        cur = tl.load(
+            state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :],
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        chunk = 0
+        while chunk < CHUNKS:
+            local_i = 0
+            while local_i < C:
+                t = chunk * C + local_i
+                vec_base = ((batch_id * T + t) * H + head_id) * N
+                r = tl.load(r_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+                w = tl.load(w_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+                key = tl.load(k_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+                kk = tl.load(kk_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+                a = tl.load(a_ptr + vec_base + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+                v_rows = tl.load(v_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
+
+                state_dot_kk = tl.sum(cur * kk[None, :], axis=1)
+                cur = cur * w[None, :] + v_rows[:, None] * key[None, :] - state_dot_kk[:, None] * kk[None, :] * a[None, :]
+                recurrent = tl.sum(cur * r[None, :], axis=1)
+                tl.store(out_ptr + vec_base + offs_i, recurrent, mask=mask_i)
+                local_i += 1
+            chunk += 1
+
+        tl.store(final_state_ptr + state_base + offs_i[:, None] * N + offs_j[None, :], cur, mask=row_mask)
 
 
 def dplr_chunk_scan_triton_available() -> bool:
@@ -2221,6 +2294,119 @@ def dplr_compact_wy_recompute_phase_probe_triton(
     return out, final_state
 
 
+def dplr_compact_wy_prefix_shared_apply_output_triton(
+    r: Any,
+    w: Any,
+    k: Any,
+    v: Any,
+    kk: Any,
+    a: Any,
+    state: Any,
+    *,
+    chunk_size: int = 64,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    force_fallback: bool = False,
+):
+    """Apply/output scan with shared chunk-prefix state and no start tensor.
+
+    This opt-in compact-WY schedule probe keeps one row block resident across
+    all chunks.  It computes each chunk's start state exactly once and consumes
+    it immediately, avoiding dense ``start_states`` materialization and the
+    duplicated compact-prefix work measured by the recompute-starts probe.
+    Because it serializes chunks within each `(batch, head, row_block)`, it is
+    primarily a bounded experiment for quantifying how much chunk-level
+    parallelism the compact route needs.
+    """
+
+    if torch is None:
+        raise RuntimeError("dplr_compact_wy_prefix_shared_apply_output_triton requires torch")
+    chunk_size_i = _validate_chunk_size(chunk_size)
+    if state.dim() != 4:
+        raise ValueError("state must be [B,H,N,N]")
+    B, H, N, N2 = (int(vv) for vv in state.shape)
+    if N != N2:
+        raise ValueError("state must be square in the last two dimensions")
+    r4, flat = _as_bthn(r, H, N, name="r")
+    w4, _ = _as_bthn(w, H, N, name="w")
+    k4, _ = _as_bthn(k, H, N, name="k")
+    v4, _ = _as_bthn(v, H, N, name="v")
+    kk4, _ = _as_bthn(kk, H, N, name="kk")
+    a4, _ = _as_bthn(a, H, N, name="a")
+    T = int(r4.shape[1])
+    if T % chunk_size_i != 0:
+        raise ValueError(f"T={T} must be divisible by chunk_size={chunk_size_i} for prefix-shared probe")
+    if block_m is None:
+        block_m = _env_int("RWKV7_DPLR_TRITON_PREFIX_SHARED_BLOCK_M", _env_int("RWKV7_DPLR_TRITON_APPLY_BLOCK_M", 8))
+    if block_n is None:
+        block_n = N
+    block_m = int(block_m)
+    block_n = int(block_n)
+    if block_m <= 0:
+        raise ValueError("block_m must be positive")
+    if block_n < N:
+        raise ValueError(f"block_n must be >= head_dim={N}; got {block_n}")
+
+    k_kernel = k4 if k4.dtype == r4.dtype else k4.to(dtype=r4.dtype)
+    v_kernel = v4 if v4.dtype == r4.dtype else v4.to(dtype=r4.dtype)
+    kk_kernel = kk4 if kk4.dtype == r4.dtype else kk4.to(dtype=r4.dtype)
+    a_kernel = a4 if a4.dtype == r4.dtype else a4.to(dtype=r4.dtype)
+    target_supported = 16 <= N <= 64 and block_n <= 64 and chunk_size_i <= 128
+    use_triton = (
+        not force_fallback
+        and target_supported
+        and _HAS_TRITON
+        and dplr_dense_chunk_summary_triton_available()
+        and r4.is_cuda
+        and w4.is_cuda
+        and k_kernel.is_cuda
+        and v_kernel.is_cuda
+        and kk_kernel.is_cuda
+        and a_kernel.is_cuda
+        and state.is_cuda
+        and state.dtype == torch.float32
+        and r4.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and w4.dtype in (r4.dtype, torch.float32)
+    )
+    if not use_triton:
+        return _fallback_scan(r4, w4, k4, v4, kk4, a4, state, flat=flat)
+
+    r_c = r4.contiguous()
+    w_c = w4.contiguous()
+    k_c = k_kernel.contiguous()
+    v_c = v_kernel.contiguous()
+    kk_c = kk_kernel.contiguous()
+    a_c = a_kernel.contiguous()
+    state_c = state.contiguous()
+    out = torch.empty((B, T, H, N), device=r4.device, dtype=r4.dtype)
+    final_state = torch.empty_like(state_c)
+    chunks = T // chunk_size_i
+    row_blocks = triton.cdiv(N, block_m)
+    _compact_wy_prefix_shared_apply_output_kernel[(B * H * row_blocks,)](
+        r_c,
+        w_c,
+        k_c,
+        v_c,
+        kk_c,
+        a_c,
+        state_c,
+        out,
+        final_state,
+        T,
+        H,
+        N,
+        chunks,
+        chunk_size_i,
+        ROW_BLOCKS=int(row_blocks),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_warps=4 if block_m < N else 8,
+    )
+    if flat:
+        out = out.reshape(B, T, H * N)
+    return out, final_state
+
+
 def dplr_dense_three_stage_triton(
     r: Any,
     w: Any,
@@ -2285,6 +2471,7 @@ def dplr_compact_wy_three_stage_triton(
     output_only: bool | None = None,
     start_dtype: Any | None = None,
     recompute_starts: bool | None = None,
+    prefix_shared: bool | None = None,
     force_fallback: bool = False,
 ):
     """Compact-WY three-stage DPLR scaffold.
@@ -2311,6 +2498,21 @@ def dplr_compact_wy_three_stage_triton(
     v4, _ = _as_bthn(v, H, N, name="v")
     kk4, _ = _as_bthn(kk, H, N, name="kk")
     a4, _ = _as_bthn(a, H, N, name="a")
+    if prefix_shared is None:
+        prefix_shared = _env_flag("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED", False)
+    if prefix_shared:
+        return dplr_compact_wy_prefix_shared_apply_output_triton(
+            r4.reshape(B, int(r4.shape[1]), H * N) if flat else r4,
+            w4,
+            k4,
+            v4,
+            kk4,
+            a4,
+            state,
+            chunk_size=chunk_size,
+            force_fallback=force_fallback,
+        )
+
     summary = dplr_compact_wy_chunk_summary_triton(
         w4,
         k4,

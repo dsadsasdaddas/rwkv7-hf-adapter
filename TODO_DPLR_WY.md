@@ -806,7 +806,7 @@ Branch: `wangyue/native-prefill-060-albatross`
     prefix per chunk. The next compact boundary must share prefix work once
     while avoiding dense start-state traffic, or compact should stay research
     only while the main fused fp16 line chases the `0.60x` stretch.
-- [ ] Next compact-WY task:
+- [x] Next compact-WY task:
   - Prototype a true prefix-shared schedule instead of another duplicated
     recompute variant. The bounded experiment should either:
     - fuse prefix+apply in a segmented/persistent schedule that computes each
@@ -818,6 +818,56 @@ Branch: `wangyue/native-prefill-060-albatross`
   - Promotion gate: same-run synthetic and HF corrected smoke must beat the
     current output-only compact route and must not regress the main fused
     recurrent scan line.
+  - Done: added opt-in prefix-shared compact apply/output schedule:
+    `RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED=1`.
+    - new helper:
+      `dplr_compact_wy_prefix_shared_apply_output_triton(...)`;
+    - new stage rows:
+      `compact_prefix_shared_apply_output` and
+      `compact3_prefix_shared_full`;
+    - HF telemetry now records
+      `prefill_dplr_compact_prefix_shared`;
+    - default HF/native behavior is unchanged unless the env flag is set.
+  - Validation:
+    - local no-torch gate: py_compile, `git diff --check`, and
+      `python tests/test_dplr_prefill_triton.py` skip/pass;
+    - 4090 gate: py_compile and `python tests/test_dplr_prefill_triton.py`
+      pass.
+  - Result files:
+    - synthetic:
+      `bench/results_4090_prefill060_dplr_compact_prefix_shared_20260703_074611.jsonl`
+      from remote `/tmp/dplr_compact_prefix_shared_4090_20260703_074611.jsonl`;
+    - HF corrected smoke:
+      `bench/results_4090_prefill060_native_dplr_prefix_shared_20260703_074742.jsonl`
+      from remote `/tmp/native_4090_dplr_prefix_shared_20260703_074742.jsonl`.
+  - 4090 synthetic `B=1,T=512,H=16,N=64,chunk=64,fp16`:
+    - output-only compact full, same run: `0.22998 ms`;
+    - prefix-shared apply/output stage: `0.16429 ms`;
+    - compact3 prefix-shared full: `0.16565 ms`;
+    - env-routed `triton_wy_compact` with prefix-shared:
+      `0.22027 ms`, `2.324M tok/s`, pass.
+  - 4090 HF corrected smoke, 0.4B / prompt512 / bsz1:
+    - same-run output-only compact baseline: pass, `17,649.4 tok/s`,
+      `29.0095 ms`, peak `996.2 MiB`;
+    - prefix-shared compact: pass, `20,205.0 tok/s`, `25.3402 ms`,
+      about `0.3875x` Albatross, peak `991.2 MiB`;
+    - correctness gates pass: greedy/cache smoke pass, decode-after-prefill
+      greedy match pass, max diff `0.125`.
+  - conclusion: prefix sharing is useful and removes the duplicated-prefix
+    loss without dense `start_states`, improving the compact HF line by about
+    `14.5%` versus same-run output-only compact. It still remains far below
+    the main fused recurrent scan line (`27,051 tok/s`, `~0.5187x`) and far
+    below the `0.60x` stretch, so keep it opt-in. The next compact work must
+    recover chunk-level parallelism without reintroducing dense starts; if that
+    is not viable, route the Albatross gap back to the main fused fp16 line.
+- [ ] Next compact-WY/mainline routing task:
+  - Try one bounded prefix-shared parallelism recovery experiment only. The
+    useful direction is a persistent/segmented producer-consumer schedule that
+    shares chunk starts without global dense `start_states` and without
+    serializing all chunks per row block. If a small prototype cannot beat the
+    prefix-shared `20,205 tok/s` HF row or approach the main `27,051 tok/s`
+    line, freeze compact-WY as a research/quantization track and move the next
+    `0.60x` experiment back to main fused fp16 recurrent-scan/output.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of
