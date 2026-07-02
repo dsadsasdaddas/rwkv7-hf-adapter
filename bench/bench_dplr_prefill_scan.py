@@ -565,6 +565,7 @@ def emit_compact_stage_probe(
     dplr_compact_wy_chunk_summary_triton: Callable[..., Any] | None,
     dplr_compact_wy_prefix_combine_torch: Callable[..., Any] | None,
     dplr_compact_wy_prefix_combine_triton: Callable[..., Any] | None,
+    dplr_compact_wy_recompute_phase_probe_triton: Callable[..., Any] | None,
     dplr_compact_wy_recompute_apply_output_triton: Callable[..., Any] | None,
     dplr_dense_chunk_apply_torch: Callable[..., Any] | None,
     dplr_dense_chunk_apply_triton: Callable[..., Any] | None,
@@ -587,6 +588,8 @@ def emit_compact_stage_probe(
         "compact3_full",
         "compact3_output_only_full",
         "compact3_recompute_starts_full",
+        "compact_recompute_prefix_only_probe",
+        "compact_recompute_token_apply_only_probe",
     )
     required = (
         dplr_compact_wy_apply_summaries_torch,
@@ -594,6 +597,7 @@ def emit_compact_stage_probe(
         dplr_compact_wy_chunk_summary_triton,
         dplr_compact_wy_prefix_combine_torch,
         dplr_compact_wy_prefix_combine_triton,
+        dplr_compact_wy_recompute_phase_probe_triton,
         dplr_compact_wy_recompute_apply_output_triton,
         dplr_dense_chunk_apply_torch,
         dplr_dense_chunk_apply_triton,
@@ -623,7 +627,12 @@ def emit_compact_stage_probe(
                 ),
                 "compact_output_only": stage
                 in {"compact_chunk_apply_output_only", "compact3_output_only_full", "compact3_recompute_starts_full"},
-                "compact_recompute_starts": stage == "compact3_recompute_starts_full",
+                "compact_recompute_starts": stage
+                in {
+                    "compact3_recompute_starts_full",
+                    "compact_recompute_prefix_only_probe",
+                    "compact_recompute_token_apply_only_probe",
+                },
             }
         )
         return row
@@ -793,6 +802,74 @@ def emit_compact_stage_probe(
             warmup=args.warmup,
             steps=args.steps,
         )
+        recompute_prefix_probe = dplr_compact_wy_recompute_phase_probe_triton(  # type: ignore[misc]
+            xs["r"],
+            xs["w"],
+            xs["k"],
+            xs["v"],
+            xs["kk"],
+            xs["a"],
+            xs["state"],
+            summary_got,
+            chunk_size=int(chunk_size),
+            phase="prefix",
+        )
+        recompute_token_probe = dplr_compact_wy_recompute_phase_probe_triton(  # type: ignore[misc]
+            xs["r"],
+            xs["w"],
+            xs["k"],
+            xs["v"],
+            xs["kk"],
+            xs["a"],
+            xs["state"],
+            summary_got,
+            chunk_size=int(chunk_size),
+            phase="token_apply",
+        )
+        recompute_prefix_probe_ms = timed(
+            lambda: dplr_compact_wy_recompute_phase_probe_triton(  # type: ignore[misc]
+                xs["r"],
+                xs["w"],
+                xs["k"],
+                xs["v"],
+                xs["kk"],
+                xs["a"],
+                xs["state"],
+                summary_got,
+                chunk_size=int(chunk_size),
+                phase="prefix",
+            ),
+            device=args.device,
+            warmup=args.warmup,
+            steps=args.steps,
+        )
+        recompute_token_probe_ms = timed(
+            lambda: dplr_compact_wy_recompute_phase_probe_triton(  # type: ignore[misc]
+                xs["r"],
+                xs["w"],
+                xs["k"],
+                xs["v"],
+                xs["kk"],
+                xs["a"],
+                xs["state"],
+                summary_got,
+                chunk_size=int(chunk_size),
+                phase="token_apply",
+            ),
+            device=args.device,
+            warmup=args.warmup,
+            steps=args.steps,
+        )
+        recompute_probe_sum_ms = float(recompute_prefix_probe_ms) + float(recompute_token_probe_ms)
+        recompute_prefix_full_ratio = (
+            float(recompute_prefix_probe_ms) / float(recompute_ms) if recompute_ms and float(recompute_ms) > 0 else None
+        )
+        recompute_token_full_ratio = (
+            float(recompute_token_probe_ms) / float(recompute_ms) if recompute_ms and float(recompute_ms) > 0 else None
+        )
+        recompute_probe_sum_full_ratio = (
+            float(recompute_probe_sum_ms) / float(recompute_ms) if recompute_ms and float(recompute_ms) > 0 else None
+        )
 
         factor_diffs = {
             f"{key}_max_abs_diff": float((summary_got[key].float() - summary_ref[key].float()).abs().max().detach().cpu())
@@ -895,11 +972,58 @@ def emit_compact_stage_probe(
             {
                 "status": "pass",
                 "state_source": "recomputed_last_chunk",
+                "recompute_prefix_probe_ms": recompute_prefix_probe_ms,
+                "recompute_token_apply_probe_ms": recompute_token_probe_ms,
+                "recompute_probe_sum_ms": recompute_probe_sum_ms,
+                "recompute_prefix_full_ratio": recompute_prefix_full_ratio,
+                "recompute_token_apply_full_ratio": recompute_token_full_ratio,
+                "recompute_probe_sum_full_ratio": recompute_probe_sum_full_ratio,
                 "peak_vram_mb": _peak_mb(args.device),
                 **recompute_pair_diff,
             }
         )
         finish_timing_row(row, B=B, T=T, ms=recompute_ms)
+        emit_stage(row)
+
+        row = make_stage_row("compact_recompute_prefix_only_probe")
+        row.update(
+            {
+                "status": "pass",
+                "state_source": "prefix_probe_checksum",
+                "recompute_prefix_probe_shape": list(recompute_prefix_probe.shape),
+                "recompute_prefix_probe_checksum_abs_max": float(
+                    recompute_prefix_probe.float().abs().max().detach().cpu()
+                ),
+                "recompute_prefix_probe_ms": recompute_prefix_probe_ms,
+                "recompute_token_apply_probe_ms": recompute_token_probe_ms,
+                "recompute_probe_sum_ms": recompute_probe_sum_ms,
+                "recompute_prefix_full_ratio": recompute_prefix_full_ratio,
+                "recompute_token_apply_full_ratio": recompute_token_full_ratio,
+                "recompute_probe_sum_full_ratio": recompute_probe_sum_full_ratio,
+                "peak_vram_mb": _peak_mb(args.device),
+            }
+        )
+        finish_timing_row(row, B=B, T=T, ms=recompute_prefix_probe_ms)
+        emit_stage(row)
+
+        row = make_stage_row("compact_recompute_token_apply_only_probe")
+        row.update(
+            {
+                "status": "pass",
+                "state_source": "initial_state_per_chunk",
+                "recompute_token_probe_out_shape": list(recompute_token_probe[0].shape)
+                if isinstance(recompute_token_probe, tuple)
+                else list(recompute_token_probe.shape),
+                "recompute_prefix_probe_ms": recompute_prefix_probe_ms,
+                "recompute_token_apply_probe_ms": recompute_token_probe_ms,
+                "recompute_probe_sum_ms": recompute_probe_sum_ms,
+                "recompute_prefix_full_ratio": recompute_prefix_full_ratio,
+                "recompute_token_apply_full_ratio": recompute_token_full_ratio,
+                "recompute_probe_sum_full_ratio": recompute_probe_sum_full_ratio,
+                "peak_vram_mb": _peak_mb(args.device),
+            }
+        )
+        finish_timing_row(row, B=B, T=T, ms=recompute_token_probe_ms)
         emit_stage(row)
     except Exception as exc:
         for stage in stages:
@@ -1188,6 +1312,7 @@ def main() -> int:
             dplr_compact_wy_prefix_combine_torch,
             dplr_compact_wy_prefix_combine_triton,
             dplr_compact_wy_prefix_combine_triton_available,
+            dplr_compact_wy_recompute_phase_probe_triton,
             dplr_compact_wy_recompute_apply_output_triton,
             dplr_compact_wy_three_stage_triton,
             dplr_dense_chunk_apply_output_triton,
@@ -1209,6 +1334,7 @@ def main() -> int:
         dplr_compact_wy_prefix_combine_torch = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_combine_triton = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_combine_triton_available = None  # type: ignore[assignment]
+        dplr_compact_wy_recompute_phase_probe_triton = None  # type: ignore[assignment]
         dplr_compact_wy_recompute_apply_output_triton = None  # type: ignore[assignment]
         dplr_compact_wy_three_stage_triton = None  # type: ignore[assignment]
         dplr_dense_chunk_apply_output_triton = None  # type: ignore[assignment]
@@ -1448,6 +1574,7 @@ def main() -> int:
                         dplr_compact_wy_chunk_summary_triton=dplr_compact_wy_chunk_summary_triton,
                         dplr_compact_wy_prefix_combine_torch=dplr_compact_wy_prefix_combine_torch,
                         dplr_compact_wy_prefix_combine_triton=dplr_compact_wy_prefix_combine_triton,
+                        dplr_compact_wy_recompute_phase_probe_triton=dplr_compact_wy_recompute_phase_probe_triton,
                         dplr_compact_wy_recompute_apply_output_triton=dplr_compact_wy_recompute_apply_output_triton,
                         dplr_dense_chunk_apply_torch=dplr_dense_chunk_apply_torch,
                         dplr_dense_chunk_apply_triton=dplr_dense_chunk_apply_triton,

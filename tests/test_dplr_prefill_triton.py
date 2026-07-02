@@ -60,6 +60,7 @@ def test_dense_chunk_summary_torch_final_state_matches_recurrent_scan() -> None:
         dplr_compact_wy_apply_summaries_torch,
         dplr_compact_wy_chunk_summary_torch,
         dplr_compact_wy_prefix_combine_torch,
+        dplr_compact_wy_recompute_phase_probe_triton,
         dplr_compact_wy_recompute_apply_output_triton,
         dplr_compact_wy_summary_to_dense,
         dplr_compact_wy_three_stage_triton,
@@ -158,6 +159,14 @@ def test_dense_chunk_summary_torch_final_state_matches_recurrent_scan() -> None:
     assert torch.allclose(recompute_state, ref_state, atol=2e-6, rtol=2e-6), (
         recompute_state - ref_state
     ).abs().max()
+    prefix_probe = dplr_compact_wy_recompute_phase_probe_triton(
+        r, w, k, v, kk, a, state, compact, chunk_size=4, phase="prefix", force_fallback=True
+    )
+    assert prefix_probe.shape == (1, 2, 2, 4)
+    token_probe = dplr_compact_wy_recompute_phase_probe_triton(
+        r, w, k, v, kk, a, state, compact, chunk_size=4, phase="token_apply", force_fallback=True
+    )
+    assert token_probe.shape == ref_out.shape
     compact3_recompute_out, compact3_recompute_state = dplr_compact_wy_three_stage_triton(
         r, w, k, v, kk, a, state, chunk_size=4, recompute_starts=True, force_fallback=True
     )
@@ -189,6 +198,7 @@ def test_dense_chunk_summary_triton_matches_torch_cuda() -> None:
         dplr_compact_wy_chunk_summary_triton,
         dplr_compact_wy_prefix_combine_torch,
         dplr_compact_wy_prefix_combine_triton,
+        dplr_compact_wy_recompute_phase_probe_triton,
         dplr_compact_wy_recompute_apply_output_triton,
         dplr_compact_wy_summary_to_dense,
         dplr_compact_wy_three_stage_triton,
@@ -306,6 +316,14 @@ def test_dense_chunk_summary_triton_matches_torch_cuda() -> None:
     assert torch.allclose(recompute_state, ref_state, atol=2e-6, rtol=2e-6), (
         recompute_state - ref_state
     ).abs().max()
+    prefix_probe = dplr_compact_wy_recompute_phase_probe_triton(
+        r, w, k, v, kk, a, state, compact_got, chunk_size=4, phase="prefix", force_fallback=True
+    )
+    assert prefix_probe.shape == (1, 2, 2, 4)
+    token_probe = dplr_compact_wy_recompute_phase_probe_triton(
+        r, w, k, v, kk, a, state, compact_got, chunk_size=4, phase="token_apply", force_fallback=True
+    )
+    assert token_probe.shape == ref_out.shape
     compact3_recompute_out, compact3_recompute_state = dplr_compact_wy_three_stage_triton(
         r, w, k, v, kk, a, state, chunk_size=4, recompute_starts=True
     )

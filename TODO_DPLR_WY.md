@@ -766,7 +766,7 @@ Branch: `wangyue/native-prefill-060-albatross`
         than the same-run output-only compact row and saves a little memory,
         but it is still far below the main fused recurrent scan line and is
         strongly negative on synthetic. Keep it opt-in; do not promote.
-- [ ] Next compact-WY task:
+- [x] Next compact-WY task:
   - Stop testing duplicated-prefix variants at the current chunk count. The
     useful next compact experiment should preserve the prefix-combine work
     efficiency while reducing dense start-state traffic, e.g. store a smaller
@@ -775,6 +775,49 @@ Branch: `wangyue/native-prefill-060-albatross`
     starts. If that is too large for one turn, first add a micro/probe that
     estimates how much of recompute-starts time is duplicated prefix vs token
     apply so the next kernel boundary is chosen from evidence.
+  - Done: added a timing-only compact recompute-starts phase probe:
+    - new helper: `dplr_compact_wy_recompute_phase_probe_triton(...)`;
+    - new stage rows:
+      `compact_recompute_prefix_only_probe` and
+      `compact_recompute_token_apply_only_probe`;
+    - analyzer now preserves the phase probe fields.
+  - Validation:
+    - local no-torch gate: py_compile, `git diff --check`, and
+      `python tests/test_dplr_prefill_triton.py` skip/pass;
+    - 4090 gate: py_compile and `python tests/test_dplr_prefill_triton.py`
+      pass.
+  - Result file:
+    `bench/results_4090_prefill060_dplr_compact_recompute_phase_probe_20260703_073554.jsonl`
+    copied from remote
+    `/tmp/dplr_compact_recompute_phase_probe_4090_20260703_073554.jsonl`.
+  - 4090 synthetic `B=1,T=512,H=16,N=64,chunk=64,fp16`, warmup `3`,
+    steps `9`:
+    - normal compact full: `0.22843 ms`;
+    - output-only compact full: `0.23002 ms`;
+    - recompute-starts full: `0.50274 ms`;
+    - duplicated-prefix-only probe: `0.34365 ms`
+      (`0.6835x` of recompute full);
+    - token-apply-only probe: `0.07983 ms`
+      (`0.1588x` of recompute full);
+    - prefix+token probe sum: `0.42348 ms`
+      (`0.8423x` of recompute full).
+  - conclusion: recompute-starts is dominated by duplicated compact-prefix
+    math, not by token apply. Do not spend another iteration on recomputing
+    prefix per chunk. The next compact boundary must share prefix work once
+    while avoiding dense start-state traffic, or compact should stay research
+    only while the main fused fp16 line chases the `0.60x` stretch.
+- [ ] Next compact-WY task:
+  - Prototype a true prefix-shared schedule instead of another duplicated
+    recompute variant. The bounded experiment should either:
+    - fuse prefix+apply in a segmented/persistent schedule that computes each
+      chunk start once and immediately consumes it, without materializing dense
+      `start_states`; or
+    - prove with a small benchmark that such a schedule loses too much
+      chunk-level parallelism, then route the remaining `0.60x` work back to
+      the main fused fp16 recurrent-scan/output line.
+  - Promotion gate: same-run synthetic and HF corrected smoke must beat the
+    current output-only compact route and must not regress the main fused
+    recurrent scan line.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of
@@ -987,8 +1030,9 @@ is either checked off or replaced with a more precise kernel task.
   - [x] 4090 / 0.4B / prompt512 / bsz1 moves toward `>=0.45x` Albatross
     - Done: fused state-scan confirmation row is `25,663.2 tok/s` (`0.4921x`).
   - [ ] stretch: `>=0.60x` Albatross
-    - Current confirmed fused state-scan row is still below the stretch target
-      `31,289 tok/s` by about `5,626 tok/s` (`~21.9%` relative uplift).
+    - Current strict confirmed row on this branch is `27,051.0 tok/s`
+      (`~0.5187x`), still below the stretch target `31,289 tok/s` by about
+      `4,238 tok/s` (`~15.7%` relative uplift).
 
 ## Big TODO routing note
 
@@ -998,10 +1042,10 @@ is either checked off or replaced with a more precise kernel task.
 - [ ] Keep two performance tracks active:
   - short-term: native fused fp16 prefill/decode kernels, starting from the
     confirmed fused state-scan row and pushing 4090 0.4B/prompt512/bsz1 from
-    `0.4921x` to `>=0.60x` Albatross;
+    the current strict `0.5187x` row to `>=0.60x` Albatross;
   - high-upside math: DPLR/WY compact chunk prefill, with next work on
-    apply/output fusion, less dense `[N,N]` traffic/materialization, and later
-    fused W8/W4 kernels.
+    prefix-shared apply/output scheduling, less dense `[N,N]`
+    traffic/materialization, and later fused W8/W4 kernels.
 - [x] Prior-art check: search official RWKV-LM, Albatross, FLA, VKWR/rwkv.cpp,
   wind_rwkv, and vLLM/SGLang RWKV work before inventing another kernel
   boundary. Current conclusion: there are strong references, but no merged
