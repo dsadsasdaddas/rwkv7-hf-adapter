@@ -460,12 +460,28 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
         r for r in filt(raw_rows, device=args.device, dtype=None)
         if r.get("axis") == "training_smoke" and r.get("backend") == "hf_adapter"
     ]
-    training_latest = latest_by_key(training_rows, lambda r: r.get("trainer_backend"))
+    training_latest = latest_by_key(training_rows, lambda r: (model_label(r), r.get("trainer_backend")))
+    checkpoint_resume_rows = [
+        r for r in filt(raw_rows, device=args.device, dtype=None)
+        if r.get("axis") == "checkpoint_resume_smoke" and r.get("backend") == "hf_adapter"
+    ]
+    checkpoint_resume_latest = latest_by_key(
+        checkpoint_resume_rows,
+        lambda r: (model_label(r), r.get("trainer_backend")),
+    )
     deepspeed_rows = [
         r for r in filt(raw_rows, device=args.device, dtype=None)
         if r.get("axis") == "deepspeed_training_smoke" and r.get("backend") == "hf_adapter"
     ]
-    deepspeed_latest = latest_by_key(deepspeed_rows, lambda r: r.get("zero_stage"))
+    deepspeed_latest = latest_by_key(deepspeed_rows, lambda r: (model_label(r), r.get("zero_stage")))
+    deepspeed_resume_rows = [
+        r for r in filt(raw_rows, device=args.device, dtype=None)
+        if r.get("axis") == "deepspeed_resume_smoke" and r.get("backend") == "hf_adapter"
+    ]
+    deepspeed_resume_latest = latest_by_key(
+        deepspeed_resume_rows,
+        lambda r: (model_label(r), r.get("zero_stage")),
+    )
     albatross_rows = [
         r for r in rows
         if r.get("axis") == "albatross_speed" and r.get("backend") == "albatross"
@@ -1286,6 +1302,22 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
         for stage, row in sorted(deepspeed_by_stage.items()):
             if row.get("status") == "pass" and float(row.get("max_trainable_delta") or 0.0) <= 0.0:
                 focus.append(f"DeepSpeed ZeRO-{stage} smoke did not update trainable params")
+    deepspeed_resume_by_stage = {
+        int(r.get("zero_stage")): r
+        for r in deepspeed_resume_latest
+        if r.get("zero_stage") is not None
+    }
+    if deepspeed_resume_by_stage:
+        passed_resume = [
+            stage
+            for stage, row in sorted(deepspeed_resume_by_stage.items())
+            if row.get("status") == "pass"
+        ]
+        if passed_resume:
+            focus.append(f"DeepSpeed ZeRO resume passes for stages {passed_resume}")
+        for stage, row in sorted(deepspeed_resume_by_stage.items()):
+            if row.get("status") == "pass" and float(row.get("resume_max_trainable_delta") or 0.0) <= 0.0:
+                focus.append(f"DeepSpeed ZeRO-{stage} resume did not update trainable params")
 
     if not albatross_latest:
         focus.append("Albatross A/B rows pending")
@@ -1578,6 +1610,9 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     "_lineno",
                     "trainer_backend",
                     "status",
+                    "model_size_label",
+                    "model_name",
+                    "hf_model_dir",
                     "train_dtype",
                     "device",
                     "attn_mode",
@@ -1594,6 +1629,35 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             )
             for r in training_latest
         ],
+        "checkpoint_resume_smoke": [
+            compact(
+                r,
+                [
+                    "_lineno",
+                    "trainer_backend",
+                    "status",
+                    "model_size_label",
+                    "model_name",
+                    "hf_model_dir",
+                    "train_dtype",
+                    "device",
+                    "attn_mode",
+                    "batch_size",
+                    "gradient_accumulation_steps",
+                    "effective_batch_size",
+                    "first_steps",
+                    "resume_steps",
+                    "global_step",
+                    "checkpoint",
+                    "first_loss",
+                    "resume_loss",
+                    "train_runtime_s",
+                    "first_max_trainable_delta",
+                    "resume_max_trainable_delta",
+                ],
+            )
+            for r in checkpoint_resume_latest
+        ],
         "deepspeed_training_smoke": [
             compact(
                 r,
@@ -1603,6 +1667,9 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     "zero_stage",
                     "status",
                     "reason",
+                    "model_size_label",
+                    "model_name",
+                    "hf_model_dir",
                     "train_dtype",
                     "device",
                     "cuda_device_count",
@@ -1620,6 +1687,41 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                 ],
             )
             for r in deepspeed_latest
+        ],
+        "deepspeed_resume_smoke": [
+            compact(
+                r,
+                [
+                    "_lineno",
+                    "trainer_backend",
+                    "zero_stage",
+                    "status",
+                    "reason",
+                    "model_size_label",
+                    "model_name",
+                    "hf_model_dir",
+                    "train_dtype",
+                    "device",
+                    "cuda_device_count",
+                    "distributed_world_size",
+                    "local_rank",
+                    "attn_mode",
+                    "batch_size",
+                    "gradient_accumulation_steps",
+                    "effective_batch_size",
+                    "first_steps",
+                    "resume_steps",
+                    "global_step",
+                    "checkpoint",
+                    "deepspeed_config",
+                    "first_loss",
+                    "resume_loss",
+                    "train_runtime_s",
+                    "first_max_trainable_delta",
+                    "resume_max_trainable_delta",
+                ],
+            )
+            for r in deepspeed_resume_latest
         ],
         "albatross_speed": [
             compact(
@@ -1905,9 +2007,21 @@ def print_text(report: dict[str, Any]) -> None:
             print(json.dumps(row, ensure_ascii=False))
     else:
         print("PENDING")
+    print("\n## checkpoint_resume_smoke")
+    if report.get("checkpoint_resume_smoke"):
+        for row in report["checkpoint_resume_smoke"]:
+            print(json.dumps(row, ensure_ascii=False))
+    else:
+        print("PENDING")
     print("\n## deepspeed_training_smoke")
     if report.get("deepspeed_training_smoke"):
         for row in report["deepspeed_training_smoke"]:
+            print(json.dumps(row, ensure_ascii=False))
+    else:
+        print("PENDING")
+    print("\n## deepspeed_resume_smoke")
+    if report.get("deepspeed_resume_smoke"):
+        for row in report["deepspeed_resume_smoke"]:
             print(json.dumps(row, ensure_ascii=False))
     else:
         print("PENDING")
