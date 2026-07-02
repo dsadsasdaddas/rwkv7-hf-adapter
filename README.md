@@ -257,6 +257,34 @@ python tests/test_deepspeed_training_smoke.py \
   --results bench/results.jsonl
 ```
 
+DeepSpeed checkpoint-resume smoke:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tests/test_deepspeed_resume_smoke.py \
+  --model /path/to/rwkv7-g1d-0.4b-hf \
+  --zero-stage 2 \
+  --train-dtype fp32 \
+  --first-steps 1 \
+  --resume-steps 2 \
+  --max-length 16
+```
+
+One-command V100 HF validation bundle used by the 2026-07-02 matrix:
+
+```bash
+# quick representative matrix
+./scripts/run_v100_hf_validation.sh --quick
+
+# broader V100 run: ZeRO3 resume probe, longer-step smokes, and quant matrix
+./scripts/run_v100_hf_validation.sh --full
+```
+
+The latest V100 HF evidence is summarized in
+[`V100_HF_VALIDATION.md`](V100_HF_VALIDATION.md).  It covers 0.4B/1.5B/2.9B
+Trainer/TRL/PEFT/ZeRO/quant paths and 7.2B PEFT + W8/W4 quantized inference
+on `2 x Tesla V100-PCIE-32GB`.
+
 HF multi-GPU `device_map` generate smoke, for the pipeline-parallel direction:
 
 ```bash
@@ -355,6 +383,16 @@ Full V100 fast-decode validation bundle:
 ```bash
 ./bench/run_v100_fast_decode_validation.sh
 python bench/summarize_results.py --device V100 --last 12
+```
+
+V100 HF performance profile bundle:
+
+```bash
+# quick fp16/bsz/quant/TTFT baseline
+./scripts/run_v100_perf_profile.sh --quick
+
+# broader 0.4B/1.5B/2.9B fp16 + W8/W4 baseline
+./scripts/run_v100_perf_profile.sh --full
 ```
 
 

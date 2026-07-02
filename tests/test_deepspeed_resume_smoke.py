@@ -62,6 +62,15 @@ def release_cuda(torch: Any, *objs: Any) -> None:
         torch.cuda.ipc_collect()
 
 
+def unset_hf_deepspeed_config() -> None:
+    try:
+        from transformers.integrations.deepspeed import unset_hf_deepspeed_config as _unset
+
+        _unset()
+    except Exception:
+        pass
+
+
 def shared_out_dir(args: argparse.Namespace, stage: int) -> str:
     run_id = os.environ.get("TORCHELASTIC_RUN_ID") or os.environ.get("MASTER_PORT", "29500")
     model_id = Path(args.model).name.replace("/", "_")
@@ -132,6 +141,12 @@ def run_stage(args: argparse.Namespace, stage: int) -> dict[str, Any]:
 
         del trainer, model, before_first, first_result
         release_cuda(torch)
+        # TrainingArguments/Trainer leave a global HF DeepSpeed weakref used by
+        # from_pretrained(). If it still points at a ZeRO-3 config, the fresh
+        # resumed model is constructed inside DeepSpeed parameter partitioning,
+        # which can break remote-code module initializers. Clear it before the
+        # second load; the resumed Trainer will recreate the config below.
+        unset_hf_deepspeed_config()
         maybe_barrier(torch)
 
         resumed_model = ds.load_lora_model(args.model, args.attn_mode, args.train_dtype)
