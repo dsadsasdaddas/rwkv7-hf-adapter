@@ -115,6 +115,65 @@ if _HAS_TRITON:
         tl.store(out_ptr + base_v + offs_v, prepared, mask=mask_v)
 
     @triton.jit
+    def _attn_output_prepare_raw_kv_kernel(
+        recurrent_ptr,
+        r_ptr,
+        k_raw_ptr,
+        v_raw_ptr,
+        a_ptr,
+        v_first_ptr,
+        v_gate_ptr,
+        g_ptr,
+        k_a_ptr,
+        rk_ptr,
+        gn_weight_ptr,
+        gn_bias_ptr,
+        out_ptr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        head_v_dim: tl.constexpr,
+        value_dim: tl.constexpr,
+        has_v_gate: tl.constexpr,
+        eps: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        batch_id = tl.program_id(0)
+        head_id = tl.program_id(1)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_v = tl.arange(0, BLOCK_V)
+        mask_n = offs_n < head_dim
+        mask_v = offs_v < head_v_dim
+        base_v = batch_id * value_dim + head_id * head_v_dim
+        base_n = batch_id * num_heads * head_dim + head_id * head_dim
+        param_base = head_id * head_dim
+
+        rec = tl.load(recurrent_ptr + base_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        mean = tl.sum(rec, axis=0) / head_v_dim
+        centered = tl.where(mask_v, rec - mean, 0.0)
+        var = tl.sum(centered * centered, axis=0) / head_v_dim
+        normed = centered * tl.rsqrt(var + eps)
+
+        rr = tl.load(r_ptr + base_n + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        kk_raw = tl.load(k_raw_ptr + base_n + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        aa = tl.load(a_ptr + base_n + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        ka = tl.load(k_a_ptr + param_base + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        rk = tl.load(rk_ptr + param_base + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        k_adj = kk_raw * (1.0 + (aa - 1.0) * ka)
+        corr_scale = tl.sum(rr * k_adj * rk, axis=0)
+
+        vv = tl.load(v_raw_ptr + base_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        if has_v_gate:
+            vf = tl.load(v_first_ptr + base_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+            vg = tl.load(v_gate_ptr + base_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+            vv = vv + (vf - vv) * vg
+        gate = tl.load(g_ptr + base_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        weight = tl.load(gn_weight_ptr + head_id * head_v_dim + offs_v, mask=mask_v, other=1.0).to(tl.float32)
+        bias = tl.load(gn_bias_ptr + head_id * head_v_dim + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        prepared = (normed * weight + bias + corr_scale * vv) * gate
+        tl.store(out_ptr + base_v + offs_v, prepared, mask=mask_v)
+
+    @triton.jit
     def _attn_output_project_kernel(
         recurrent_ptr,
         r_ptr,
@@ -187,6 +246,12 @@ def fused_attn_output_prepare_available() -> bool:
 
 def fused_attn_output_prepare_from_correction_available() -> bool:
     """Return whether fused output-prep can consume precomputed correction."""
+
+    return bool(_HAS_TRITON and torch is not None)
+
+
+def fused_attn_output_prepare_raw_kv_available() -> bool:
+    """Return whether fused output-prep can recompute correction from raw K/V."""
 
     return bool(_HAS_TRITON and torch is not None)
 
@@ -376,6 +441,126 @@ def fused_attn_output_prepare_from_correction(
             head_v_dim=int(head_v_dim),
             value_dim=value_dim,
             eps=float(eps),
+            BLOCK_V=block_v,
+            num_warps=1,
+        )
+    if had_seq:
+        return out.unsqueeze(1)
+    return out
+
+
+def fused_attn_output_prepare_raw_kv(
+    recurrent_out: Any,
+    r: Any,
+    k_raw: Any,
+    v_raw: Any,
+    a: Any,
+    g: Any,
+    k_a: Any,
+    r_k: Any,
+    group_norm_weight: Any,
+    group_norm_bias: Any,
+    *,
+    v_first: Any | None = None,
+    v_gate: Any | None = None,
+    num_heads: int,
+    head_dim: int,
+    head_v_dim: int,
+    eps: float,
+    force_fallback: bool = False,
+):
+    """Prepare attention output while recomputing correction from raw K/V/A.
+
+    This pairs with a no-K/V-writeback state-prep scan.  It recomputes the
+    adjusted K and interpolated V needed by the RWKV correction outside the
+    dominant scan kernel, leaving group norm and G gating fused as usual.
+    """
+
+    if torch is None or F is None:
+        raise RuntimeError("fused_attn_output_prepare_raw_kv requires torch")
+    value_dim = int(num_heads) * int(head_v_dim)
+    rec2, had_seq = _flatten_2d(recurrent_out, value_dim, name="recurrent_out")
+    g2, g_had_seq = _flatten_2d(g, value_dim, name="g")
+    if g_had_seq != had_seq or tuple(g2.shape) != tuple(rec2.shape):
+        raise ValueError("recurrent_out and g must have identical flattened shape/layout")
+    r3 = _flatten_head(r, int(num_heads), int(head_dim), name="r")
+    k3 = _flatten_head(k_raw, int(num_heads), int(head_dim), name="k_raw")
+    v3 = _flatten_head(v_raw, int(num_heads), int(head_v_dim), name="v_raw")
+    a3 = _flatten_head(a, int(num_heads), int(head_dim), name="a")
+    batch = int(rec2.shape[0])
+    if any(int(t.shape[0]) != batch for t in (r3, k3, v3, a3)):
+        raise ValueError("r/k/v/a batch size must match recurrent_out")
+    has_v_gate = v_first is not None and v_gate is not None
+    if has_v_gate:
+        vf3 = _flatten_head(v_first, int(num_heads), int(head_v_dim), name="v_first")
+        vg3 = _flatten_head(v_gate, int(num_heads), int(head_v_dim), name="v_gate")
+        if int(vf3.shape[0]) != batch or int(vg3.shape[0]) != batch:
+            raise ValueError("v_first/v_gate batch size must match recurrent_out")
+    else:
+        vf3 = v3
+        vg3 = v3
+    if k_a.dim() != 2 or int(k_a.shape[0]) != int(num_heads) or int(k_a.shape[1]) != int(head_dim):
+        raise ValueError(f"k_a must be [{num_heads}, {head_dim}], got {tuple(k_a.shape)}")
+    if r_k.dim() != 2 or int(r_k.shape[0]) != int(num_heads) or int(r_k.shape[1]) != int(head_dim):
+        raise ValueError(f"r_k must be [{num_heads}, {head_dim}], got {tuple(r_k.shape)}")
+    if group_norm_weight.dim() != 1 or int(group_norm_weight.shape[0]) != value_dim:
+        raise ValueError(f"group_norm_weight must be [{value_dim}], got {tuple(group_norm_weight.shape)}")
+    if group_norm_bias.dim() != 1 or int(group_norm_bias.shape[0]) != value_dim:
+        raise ValueError(f"group_norm_bias must be [{value_dim}], got {tuple(group_norm_bias.shape)}")
+
+    tensors = [rec2, r3, k3, v3, a3, g2, k_a, r_k, group_norm_weight, group_norm_bias]
+    if has_v_gate:
+        tensors.extend([vf3, vg3])
+    use_triton = (
+        not force_fallback
+        and fused_attn_output_prepare_raw_kv_available()
+        and all(t.is_cuda for t in tensors)
+        and rec2.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and all(t.dtype == rec2.dtype for t in tensors)
+        and int(head_dim) <= 128
+        and int(head_v_dim) <= 128
+    )
+    if not use_triton:
+        normed = F.group_norm(rec2, num_groups=int(num_heads), weight=group_norm_weight, bias=group_norm_bias, eps=float(eps))
+        k_adj = k3 * (1 + (a3 - 1) * k_a.view(1, int(num_heads), int(head_dim)))
+        if has_v_gate:
+            v_adj = v3 + (vf3 - v3) * vg3
+        else:
+            v_adj = v3
+        correction = ((r3 * k_adj * r_k.view(1, int(num_heads), int(head_dim))).sum(-1, keepdim=True) * v_adj).reshape(batch, value_dim)
+        out = (normed + correction) * g2
+    else:
+        rec_c, r_c, k_c, v_c, a_c, g_c = [t.contiguous() for t in (rec2, r3, k3, v3, a3, g2)]
+        vf_c = vf3.contiguous()
+        vg_c = vg3.contiguous()
+        ka_c = k_a.contiguous()
+        rk_c = r_k.contiguous()
+        w_c = group_norm_weight.contiguous()
+        b_c = group_norm_bias.contiguous()
+        out = torch.empty_like(rec2)
+        block_n = triton.next_power_of_2(int(head_dim))
+        block_v = triton.next_power_of_2(int(head_v_dim))
+        _attn_output_prepare_raw_kv_kernel[(batch, int(num_heads))](
+            rec_c,
+            r_c,
+            k_c,
+            v_c,
+            a_c,
+            vf_c,
+            vg_c,
+            g_c,
+            ka_c,
+            rk_c,
+            w_c,
+            b_c,
+            out,
+            num_heads=int(num_heads),
+            head_dim=int(head_dim),
+            head_v_dim=int(head_v_dim),
+            value_dim=value_dim,
+            has_v_gate=bool(has_v_gate),
+            eps=float(eps),
+            BLOCK_N=block_n,
             BLOCK_V=block_v,
             num_warps=1,
         )

@@ -248,6 +248,34 @@ Branch: `wangyue/native-prefill-060-albatross`
     because the extra dot products increase arithmetic/register pressure inside
     the already-dominant scan kernel. Keep it disabled by default and do not
     promote it.
+- [x] Try no-K/V-writeback scan plus raw-K/V output-prep recompute:
+  - added opt-in `RWKV7_NATIVE_PREFILL_FUSED_STATE_SCAN_RAW_OUTPUT=1`.
+  - implementation:
+    - `fused_recurrent_scan_state_prep_nokv(...)` runs the full-head
+      state-prep scan and returns only `(recurrent, final_state)`, skipping
+      adjusted K/V global writeback from the dominant scan kernel.
+    - `fused_attn_output_prepare_raw_kv(...)` recomputes adjusted K and
+      interpolated V from raw K/V/A plus `k_a`/`v_gate` during output prep, so
+      the correction still matches the baseline path.
+    - benchmark/profiler/analyzer telemetry now records
+      `prefill_fused_state_scan_raw_output_*`.
+    - default HF/native behavior stays unchanged unless the env flag is set.
+  - validation result files:
+    - `bench/results_4090_prefill060_state_scan_raw_output_smoke_20260703_000043.jsonl`
+    - `bench/results_4090_prefill060_state_scan_raw_output_confirm_20260703_000125.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_state_scan_raw_output_smoke_20260703_000043.jsonl`
+    - `/tmp/native_4090_state_scan_raw_output_confirm_20260703_000125.jsonl`
+  - confirmation rows, both pass greedy/cache smoke:
+    - current baseline full-head state-scan + fused output:
+      `26,056.9 tok/s`, `19.6493 ms`, about `0.4997x` Albatross.
+    - no-K/V scan + raw-K/V output recompute: `25,941.7 tok/s`,
+      `19.7366 ms`, about `0.4975x` Albatross, max diff `0.125`.
+  - conclusion: correctness is acceptable and this directly tested whether K/V
+    writeback was the bottleneck, but the recompute path is only parity/slightly
+    slower on 4090. Keep it disabled by default; the remaining gap is inside
+    the state update/readout math and likely needs a dedicated CUDA/persistent
+    scan/layout rewrite rather than more output-boundary movement.
 - [ ] Next corrected-harness experiment:
   - remaining credible path is no longer wrapper/projection fusion. Target the
     internal full-head `fused_recurrent_scan_state_prep` kernel itself, likely

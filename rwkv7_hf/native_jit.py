@@ -52,6 +52,8 @@ try:  # pragma: no cover - optional Triton fast path on CUDA hosts
         fused_recurrent_scan_clampw_available,
         fused_recurrent_scan_state_prep,
         fused_recurrent_scan_state_prep_available,
+        fused_recurrent_scan_state_prep_nokv,
+        fused_recurrent_scan_state_prep_nokv_available,
         fused_recurrent_scan_state_prep_correction,
         fused_recurrent_scan_state_prep_correction_available,
         fused_recurrent_scan_state_prep_output_prepare,
@@ -72,6 +74,8 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
             fused_recurrent_scan_clampw_available,
             fused_recurrent_scan_state_prep,
             fused_recurrent_scan_state_prep_available,
+            fused_recurrent_scan_state_prep_nokv,
+            fused_recurrent_scan_state_prep_nokv_available,
             fused_recurrent_scan_state_prep_correction,
             fused_recurrent_scan_state_prep_correction_available,
             fused_recurrent_scan_state_prep_output_prepare,
@@ -90,6 +94,8 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
         fused_recurrent_scan_clampw_available = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep_available = None  # type: ignore[assignment]
+        fused_recurrent_scan_state_prep_nokv = None  # type: ignore[assignment]
+        fused_recurrent_scan_state_prep_nokv_available = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep_correction = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep_correction_available = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep_output_prepare = None  # type: ignore[assignment]
@@ -113,6 +119,8 @@ try:  # pragma: no cover - optional Triton fast path on CUDA hosts
         fused_attn_output_prepare_available,
         fused_attn_output_prepare_from_correction,
         fused_attn_output_prepare_from_correction_available,
+        fused_attn_output_prepare_raw_kv,
+        fused_attn_output_prepare_raw_kv_available,
         fused_attn_output_project,
         fused_attn_output_project_available,
     )
@@ -123,6 +131,8 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
             fused_attn_output_prepare_available,
             fused_attn_output_prepare_from_correction,
             fused_attn_output_prepare_from_correction_available,
+            fused_attn_output_prepare_raw_kv,
+            fused_attn_output_prepare_raw_kv_available,
             fused_attn_output_project,
             fused_attn_output_project_available,
         )
@@ -131,6 +141,8 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
         fused_attn_output_prepare_available = None  # type: ignore[assignment]
         fused_attn_output_prepare_from_correction = None  # type: ignore[assignment]
         fused_attn_output_prepare_from_correction_available = None  # type: ignore[assignment]
+        fused_attn_output_prepare_raw_kv = None  # type: ignore[assignment]
+        fused_attn_output_prepare_raw_kv_available = None  # type: ignore[assignment]
         fused_attn_output_project = None  # type: ignore[assignment]
         fused_attn_output_project_available = None  # type: ignore[assignment]
 
@@ -363,6 +375,26 @@ def _native_prefill_fused_state_scan_correction_enabled() -> bool:
     try:
         return bool(fused_recurrent_scan_state_prep_correction_available()) and bool(
             fused_attn_output_prepare_from_correction_available()
+        )
+    except Exception:
+        return False
+
+
+def _native_prefill_fused_state_scan_raw_output_enabled() -> bool:
+    """Runtime switch for no-K/V scan plus raw-K/V output-prep recompute."""
+
+    if not env_flag("RWKV7_NATIVE_PREFILL_FUSED_STATE_SCAN_RAW_OUTPUT", False):
+        return False
+    if (
+        fused_recurrent_scan_state_prep_nokv is None
+        or fused_recurrent_scan_state_prep_nokv_available is None
+        or fused_attn_output_prepare_raw_kv is None
+        or fused_attn_output_prepare_raw_kv_available is None
+    ):
+        return False
+    try:
+        return bool(fused_recurrent_scan_state_prep_nokv_available()) and bool(
+            fused_attn_output_prepare_raw_kv_available()
         )
     except Exception:
         return False
@@ -1330,28 +1362,37 @@ def prefill(
         use_fused_state_scan_correction = (
             _native_prefill_fused_state_scan_correction_enabled() and not use_fused_state_scan_output
         )
+        use_fused_state_scan_raw_output = (
+            _native_prefill_fused_state_scan_raw_output_enabled()
+            and not use_fused_state_scan_output
+            and not use_fused_state_scan_correction
+        )
         use_fused_scan_output = (
             _native_prefill_fused_scan_output_enabled()
             and not use_fused_state_scan_output
             and not use_fused_state_scan_correction
+            and not use_fused_state_scan_raw_output
         )
         use_clampw_scan = (
             _native_prefill_fused_clampw_scan_enabled()
             and not use_fused_scan_output
             and not use_fused_state_scan_output
             and not use_fused_state_scan_correction
+            and not use_fused_state_scan_raw_output
         )
         use_fused_state_scan = (
             _native_prefill_fused_state_scan_enabled()
             and not use_fused_scan_output
             and not use_fused_state_scan_output
             and not use_fused_state_scan_correction
+            and not use_fused_state_scan_raw_output
         )
         if use_clampw_scan and _native_prefill_fused_state_prep_enabled() and fused_prefill_kv_kk_prep is None:
             use_clampw_scan = False
         state_scan_done = False
         state_scan_output_done = False
         state_scan_correction_done = False
+        state_scan_raw_output_done = False
         correction = None
         if use_fused_state_scan_output:
             state_scan_num_warps = _native_prefill_scan_num_warps(N, N)
@@ -1442,6 +1483,47 @@ def prefill(
             correction = correction.reshape(B, T, hidden)
             state_scan_done = True
             state_scan_correction_done = True
+        elif use_fused_state_scan_raw_output:
+            state_scan_block_m = _native_prefill_scan_block_m(N)
+            state_scan_num_warps = _native_prefill_scan_num_warps(N, state_scan_block_m)
+            state_scan_num_stages = _native_prefill_scan_num_stages()
+            if layer_idx == 0:
+                out, new_state = fused_recurrent_scan_state_prep_nokv(
+                    r.view(B, T, H, N),
+                    w.view(B, T, H, N),
+                    k.view(B, T, H, N),
+                    v.view(B, T, H, N),
+                    a.view(B, T, H, N),
+                    state[layer_idx],
+                    k_k,
+                    k_a,
+                    block_n=N,
+                    block_m=state_scan_block_m,
+                    num_warps=state_scan_num_warps,
+                    num_stages=state_scan_num_stages,
+                )
+                # Raw V is also the adjusted V for layer 0.
+                v_first_seq = v
+            else:
+                out, new_state = fused_recurrent_scan_state_prep_nokv(
+                    r.view(B, T, H, N),
+                    w.view(B, T, H, N),
+                    k.view(B, T, H, N),
+                    v.view(B, T, H, N),
+                    a.view(B, T, H, N),
+                    state[layer_idx],
+                    k_k,
+                    k_a,
+                    v_first=v_first_seq.view(B, T, H, N),
+                    v_gate=v_gate.view(B, T, H, N),
+                    block_n=N,
+                    block_m=state_scan_block_m,
+                    num_warps=state_scan_num_warps,
+                    num_stages=state_scan_num_stages,
+                )
+            out = out.reshape(B, T, hidden)
+            state_scan_done = True
+            state_scan_raw_output_done = True
         elif use_fused_state_scan:
             state_scan_block_m = _native_prefill_scan_block_m(N)
             state_scan_num_warps = _native_prefill_scan_num_warps(N, state_scan_block_m)
@@ -1583,6 +1665,43 @@ def prefill(
                 head_v_dim=N,
                 eps=eps,
             ).view(B, T, hidden)
+        elif state_scan_raw_output_done:
+            if layer_idx == 0:
+                out = fused_attn_output_prepare_raw_kv(
+                    out.reshape(B * T, hidden),
+                    r.reshape(B * T, H, N),
+                    k.reshape(B * T, H, N),
+                    v.reshape(B * T, H, N),
+                    a.reshape(B * T, H, N),
+                    g.reshape(B * T, hidden),
+                    k_a.view(H, N),
+                    r_k,
+                    gn_w,
+                    gn_b,
+                    num_heads=H,
+                    head_dim=N,
+                    head_v_dim=N,
+                    eps=eps,
+                ).view(B, T, hidden)
+            else:
+                out = fused_attn_output_prepare_raw_kv(
+                    out.reshape(B * T, hidden),
+                    r.reshape(B * T, H, N),
+                    k.reshape(B * T, H, N),
+                    v.reshape(B * T, H, N),
+                    a.reshape(B * T, H, N),
+                    g.reshape(B * T, hidden),
+                    k_a.view(H, N),
+                    r_k,
+                    gn_w,
+                    gn_b,
+                    v_first=v_first_seq.reshape(B * T, H, N),
+                    v_gate=v_gate.reshape(B * T, H, N),
+                    num_heads=H,
+                    head_dim=N,
+                    head_v_dim=N,
+                    eps=eps,
+                ).view(B, T, hidden)
         elif _native_prefill_fused_output_project_enabled():
             out = fused_attn_output_project(
                 out.reshape(B * T, hidden),
