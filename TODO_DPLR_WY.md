@@ -190,11 +190,43 @@ Branch: `wangyue/native-prefill-060-albatross`
     represented by an opt-in experiment, but it is slower on 4090 because the
     correction reduction increases pressure in the already-dominant scan
     kernel. Keep it disabled by default and do not promote it.
+- [x] Try deeper pre-scan projection/LoRA boundary:
+  - added opt-in `RWKV7_NATIVE_PREFILL_FUSED_PROJECTION=1`.
+  - implementation:
+    - prefill layer 0 can use existing `fused_rkv_wag_projection(...)` for
+      R/K/V dense projections plus W/A/G LoRA.
+    - prefill layers after 0 can use existing
+      `fused_rkv_wavg_projection(...)` for R/K/V plus W/A/G/V-gate LoRA.
+    - telemetry records request/effective/max rows and block M/R/K knobs.
+    - default HF/native path stays unchanged unless the env flag is set.
+  - validation result files:
+    - `bench/results_4090_prefill060_fused_projection_smoke_20260702_153144.jsonl`
+    - `bench/results_4090_prefill060_fused_projection_sweep_20260702_153224.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_prefill_fused_projection_smoke_20260702_153144.jsonl`
+    - `/tmp/native_4090_prefill_fused_projection_sweep_20260702_153224.jsonl`
+  - rows all pass greedy/cache smoke, but are much slower than the current
+    full-head state-scan + fused-output baseline:
+    - `block_m=64,block_r=64,block_k=64`: `20,204.5 tok/s`,
+      about `0.3874x` Albatross.
+    - `block_m=128,block_r=64,block_k=64`: `19,793.3 tok/s`,
+      about `0.3796x` Albatross.
+    - `block_m=64,block_r=64,block_k=128`: `17,699.2 tok/s`,
+      about `0.3394x` Albatross.
+    - `block_m=128,block_r=64,block_k=128`: `17,317.0 tok/s`,
+      about `0.3321x` Albatross.
+    - `block_m=128,block_r=128,block_k=128`: `16,732.3 tok/s`,
+      about `0.3209x` Albatross.
+  - conclusion: this deeper boundary is now represented by an opt-in
+    experiment, but it is negative on 4090 because the Triton dense-projection
+    replacement loses badly to cuBLAS for the prefill matrix shapes. Keep it
+    disabled by default and do not promote it.
 - [ ] Next corrected-harness experiment:
-  - target `fused_recurrent_scan_state_prep` internal cost directly beyond
-    shallow scheduling knobs; reduced K/V writeback is tested and negative, so
-    the next candidate is a deeper pre-scan projection/LoRA boundary that does
-    not add a standalone launch.
+  - remaining credible path is no longer wrapper/projection fusion. Target the
+    internal full-head `fused_recurrent_scan_state_prep` kernel itself, likely
+    via an Albatross/RWKV-LM-style dedicated CUDA/persistent scan or a deeper
+    rewrite of the scan math/layout. Keep current Triton negative experiments
+    available but disabled.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `26,745.8 tok/s` (`~0.5129x`), still about `17.0%` short of the stretch.

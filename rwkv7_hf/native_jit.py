@@ -503,6 +503,59 @@ def _native_prefill_fused_wavg_lora_blocks() -> tuple[int, int, int]:
     return vals[0], vals[1], vals[2]
 
 
+def _native_prefill_fused_projection_requested() -> bool:
+    """Return whether the prefill R/K/V + LoRA projection fusion probe is requested."""
+
+    return env_flag("RWKV7_NATIVE_PREFILL_FUSED_PROJECTION", False)
+
+
+def _native_prefill_fused_projection_max_m() -> int:
+    """Maximum flattened rows for the prefill fused projection experiment."""
+
+    return env_int("RWKV7_NATIVE_PREFILL_FUSED_PROJECTION_MAX_M", 1024, lower=1, upper=1 << 30)
+
+
+def _native_prefill_fused_projection_enabled(total_rows: int) -> bool:
+    """Runtime switch for prefill R/K/V + W/A/G(/V-gate) projection fusion."""
+
+    if not _native_prefill_fused_projection_requested():
+        return False
+    if int(total_rows) > _native_prefill_fused_projection_max_m():
+        return False
+    if (
+        fused_rkv_wag_projection is None
+        or fused_rkv_wag_projection_available is None
+        or fused_rkv_wavg_projection is None
+        or fused_rkv_wavg_projection_available is None
+    ):
+        return False
+    try:
+        return bool(fused_rkv_wag_projection_available()) and bool(fused_rkv_wavg_projection_available())
+    except Exception:
+        return False
+
+
+def _native_prefill_fused_projection_blocks() -> tuple[int, int, int]:
+    """Return ``(block_m, block_r, block_k)`` for prefill fused projection."""
+
+    vals = []
+    for name, fallback, default, upper in (
+        ("RWKV7_NATIVE_PREFILL_FUSED_PROJECTION_BLOCK_M", "RWKV7_NATIVE_GRAPH_FUSED_PROJECTION_BLOCK_M", 64, 128),
+        ("RWKV7_NATIVE_PREFILL_FUSED_PROJECTION_BLOCK_R", "RWKV7_NATIVE_GRAPH_FUSED_PROJECTION_BLOCK_R", 64, 128),
+        ("RWKV7_NATIVE_PREFILL_FUSED_PROJECTION_BLOCK_K", "RWKV7_NATIVE_GRAPH_FUSED_PROJECTION_BLOCK_K", 64, 256),
+    ):
+        raw = os.environ.get(name, os.environ.get(fallback))
+        if raw is None:
+            vals.append(env_int(name, int(default), lower=1, upper=upper))
+        else:
+            try:
+                val = int(str(raw).strip())
+            except ValueError:
+                val = int(default)
+            vals.append(min(max(1, val), upper))
+    return vals[0], vals[1], vals[2]
+
+
 def _native_graph_fused_recurrent_output_enabled() -> bool:
     """Runtime switch for fused recurrent update plus output-prep."""
 
@@ -1169,11 +1222,71 @@ def prefill(
             xa = h + xx * x_a.view(1, 1, hidden)
             xg = h + xx * x_g.view(1, 1, hidden)
 
-        r = F.linear(xr, Rw)
-        k = F.linear(xk, Kw)
-        v = F.linear(xv, Vw)
         v_gate = None
-        use_prefill_wavg_lora = layer_idx > 0 and _native_prefill_fused_wavg_lora_enabled(B * T)
+        use_prefill_projection = _native_prefill_fused_projection_enabled(B * T)
+        if use_prefill_projection:
+            block_m, block_r, block_k = _native_prefill_fused_projection_blocks()
+            if layer_idx == 0:
+                r, k, v, w, a, g = fused_rkv_wag_projection(
+                    xr,
+                    xk,
+                    xv,
+                    xw,
+                    xa,
+                    xg,
+                    Rw,
+                    Kw,
+                    Vw,
+                    w1,
+                    a1,
+                    g1,
+                    w2,
+                    a2,
+                    g2,
+                    w0,
+                    a0,
+                    None,
+                    block_m=block_m,
+                    block_r=block_r,
+                    block_k=block_k,
+                )
+                a = torch.sigmoid(a)
+            else:
+                r, k, v, w, a, g, v_gate = fused_rkv_wavg_projection(
+                    xr,
+                    xk,
+                    xv,
+                    xw,
+                    xa,
+                    xg,
+                    Rw,
+                    Kw,
+                    Vw,
+                    w1,
+                    a1,
+                    g1,
+                    v1,
+                    w2,
+                    a2,
+                    g2,
+                    v2,
+                    w0,
+                    a0,
+                    None,
+                    v0,
+                    block_m=block_m,
+                    block_r=block_r,
+                    block_k=block_k,
+                )
+                a = torch.sigmoid(a)
+                v_gate = torch.sigmoid(v_gate)
+        else:
+            r = F.linear(xr, Rw)
+            k = F.linear(xk, Kw)
+            v = F.linear(xv, Vw)
+        use_prefill_wavg_lora = (
+            not use_prefill_projection and layer_idx > 0 and _native_prefill_fused_wavg_lora_enabled(B * T)
+        )
         if use_prefill_wavg_lora:
             block_m, block_r, block_k = _native_prefill_fused_wavg_lora_blocks()
             w, a, g, v_gate = fused_wavg_lora(
@@ -1201,7 +1314,7 @@ def prefill(
             a = torch.sigmoid(a.view(B, T, hidden))
             g = g.view(B, T, hidden)
             v_gate = v_gate.view(B, T, hidden)
-        else:
+        elif not use_prefill_projection:
             w = F.linear(torch.tanh(F.linear(xw, w1)), w2, w0)
             a = torch.sigmoid(a0 + F.linear(F.linear(xa, a1), a2))
             g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
