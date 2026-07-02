@@ -62,6 +62,7 @@ def test_dense_chunk_summary_torch_final_state_matches_recurrent_scan() -> None:
         dplr_compact_wy_prefix_combine_torch,
         dplr_compact_wy_summary_to_dense,
         dplr_compact_wy_three_stage_triton,
+        dplr_dense_chunk_apply_output_triton,
         dplr_dense_chunk_apply_torch,
         dplr_dense_chunk_summary_torch,
         dplr_dense_prefix_combine_torch,
@@ -103,6 +104,10 @@ def test_dense_chunk_summary_torch_final_state_matches_recurrent_scan() -> None:
     got_out, chunk_ends = dplr_dense_chunk_apply_torch(r, w, k, v, kk, a, start_states, chunk_size=4)
     assert torch.allclose(got_out, ref_out, atol=2e-6, rtol=2e-6), (got_out - ref_out).abs().max()
     assert torch.allclose(chunk_ends[:, -1], ref_state, atol=2e-6, rtol=2e-6), (chunk_ends[:, -1] - ref_state).abs().max()
+    got_out_only = dplr_dense_chunk_apply_output_triton(
+        r, w, k, v, kk, a, start_states, chunk_size=4, force_fallback=True
+    )
+    assert torch.allclose(got_out_only, ref_out, atol=2e-6, rtol=2e-6), (got_out_only - ref_out).abs().max()
 
     dense3_out, dense3_state = dplr_dense_three_stage_triton(
         r, w, k, v, kk, a, state, chunk_size=4, force_fallback=True
@@ -116,6 +121,15 @@ def test_dense_chunk_summary_torch_final_state_matches_recurrent_scan() -> None:
     assert torch.allclose(compact3_out, ref_out, atol=2e-6, rtol=2e-6), (compact3_out - ref_out).abs().max()
     assert torch.allclose(compact3_state, ref_state, atol=2e-6, rtol=2e-6), (
         compact3_state - ref_state
+    ).abs().max()
+    compact3_out_only, compact3_state_only = dplr_compact_wy_three_stage_triton(
+        r, w, k, v, kk, a, state, chunk_size=4, output_only=True, force_fallback=True
+    )
+    assert torch.allclose(compact3_out_only, ref_out, atol=2e-6, rtol=2e-6), (
+        compact3_out_only - ref_out
+    ).abs().max()
+    assert torch.allclose(compact3_state_only, ref_state, atol=2e-6, rtol=2e-6), (
+        compact3_state_only - ref_state
     ).abs().max()
 
 
@@ -141,6 +155,7 @@ def test_dense_chunk_summary_triton_matches_torch_cuda() -> None:
         dplr_compact_wy_prefix_combine_triton,
         dplr_compact_wy_summary_to_dense,
         dplr_compact_wy_three_stage_triton,
+        dplr_dense_chunk_apply_output_triton,
         dplr_dense_prefix_combine_torch,
         dplr_dense_prefix_combine_triton,
         dplr_dense_three_stage_triton,
@@ -215,6 +230,10 @@ def test_dense_chunk_summary_triton_matches_torch_cuda() -> None:
     )
     assert torch.allclose(out_got, out_ref, atol=2e-6, rtol=2e-6), (out_got - out_ref).abs().max()
     assert torch.allclose(ends_got, ends_ref, atol=2e-6, rtol=2e-6), (ends_got - ends_ref).abs().max()
+    out_only_got = dplr_dense_chunk_apply_output_triton(
+        r, w, k, v, kk, a, starts_got, chunk_size=4, block_m=2
+    )
+    assert torch.allclose(out_only_got, out_ref, atol=2e-6, rtol=2e-6), (out_only_got - out_ref).abs().max()
 
     dense3_out, dense3_state = dplr_dense_three_stage_triton(r, w, k, v, kk, a, state, chunk_size=4)
     assert torch.allclose(dense3_out, ref_out, atol=2e-6, rtol=2e-6), (dense3_out - ref_out).abs().max()
@@ -224,6 +243,15 @@ def test_dense_chunk_summary_triton_matches_torch_cuda() -> None:
     assert torch.allclose(compact3_out, ref_out, atol=2e-6, rtol=2e-6), (compact3_out - ref_out).abs().max()
     assert torch.allclose(compact3_state, ref_state, atol=2e-6, rtol=2e-6), (
         compact3_state - ref_state
+    ).abs().max()
+    compact3_out_only, compact3_state_only = dplr_compact_wy_three_stage_triton(
+        r, w, k, v, kk, a, state, chunk_size=4, output_only=True
+    )
+    assert torch.allclose(compact3_out_only, ref_out, atol=2e-6, rtol=2e-6), (
+        compact3_out_only - ref_out
+    ).abs().max()
+    assert torch.allclose(compact3_state_only, ref_state, atol=2e-6, rtol=2e-6), (
+        compact3_state_only - ref_state
     ).abs().max()
 
 

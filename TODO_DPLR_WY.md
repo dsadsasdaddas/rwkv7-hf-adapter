@@ -628,7 +628,7 @@ Branch: `wangyue/native-prefill-060-albatross`
       persistent/inter-CTA CUDA rewrite remains possible but is a larger design
       item; the next bounded experiment should pivot back to the high-upside
       DPLR/WY compact apply/output fusion track.
-- [ ] Next corrected-harness experiment:
+- [x] Next corrected-harness experiment:
   - CUDA rowgroup, row-block, full precompute, reduced-temp precompute, and
     CTA-local cooperative rows-per-block plus warp-specialized producer/worker
     testing, plus the new row-block micro/profiler, narrowed the remaining
@@ -639,6 +639,53 @@ Branch: `wangyue/native-prefill-060-albatross`
     then the corrected 4090 HF smoke. Do not promote wrapper/projection fusion
     or the current rowgroup, row-block, full-precompute, reduced-temp,
     CTA-local cooperative, warp-specialized, or micro-only scaffolds.
+  - Done: added the opt-in compact apply/output experiment
+    `RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY=1`.
+    - implementation:
+      - new `dplr_dense_chunk_apply_output_triton(...)` mirrors the existing
+        dense chunk apply/output stage but omits dense `chunk_end_state`
+        materialization;
+      - `dplr_compact_wy_three_stage_triton(..., output_only=True)` now uses
+        compact prefix-combine's `prefix_final` as the final state, so stage 3
+        only emits recurrent outputs;
+      - `bench/bench_dplr_prefill_scan.py --compact-stage-probe` records
+        compact summary/prefix/apply/full timings plus output-only timings;
+      - default HF/DPLR behavior is unchanged unless the env flag is set.
+    - correctness:
+      - 4090 unit gate: `python tests/test_dplr_prefill_triton.py` passes.
+      - synthetic oracle file:
+        `bench/results_4090_prefill060_dplr_compact_output_probe_20260703_030000.jsonl`
+      - HF corrected smoke file:
+        `bench/results_4090_prefill060_native_dplr_compact_output_probe_20260703_030000.jsonl`
+      - both synthetic and HF rows pass with `out_min_cosine=1.0`; HF greedy
+        and decode-after-prefill smoke pass.
+    - 4090 synthetic stage probe, `B=1,T=512,H=16,N=64,chunk=64,fp16`:
+      - compact summary: `0.14335 ms`;
+      - compact prefix: `0.05637 ms`;
+      - normal compact apply/output: `0.05847 ms`;
+      - output-only apply/output: `0.05330 ms` (`~8.8%` faster for the apply
+        stage);
+      - full compact path: `0.22795 ms`;
+      - full output-only compact path: `0.22985 ms` in the stage-probe row
+        and `0.25851 ms` in the separate env row, so synthetic end-to-end does
+        not justify promoting the flag.
+    - 4090 HF corrected smoke, 0.4B / prompt512 / bsz1:
+      - normal `triton_wy_compact`: pass, `17,329.4 tok/s`, `29.5452 ms`,
+        peak `1038.5 MiB`;
+      - output-only compact: pass, `18,345.6 tok/s`, `27.9085 ms`, peak
+        `996.2 MiB`.
+      - conclusion: this bounded fusion is useful and memory-positive in the
+        HF path (`~5.9%` faster than same-run compact baseline and `~42 MiB`
+        less peak VRAM), but still far below the main fused recurrent scan
+        line and far below the `0.60x` Albatross stretch. Keep it opt-in.
+- [ ] Next compact-WY task:
+  - The output-only apply experiment shows chunk-end writeback is worth
+    removing in HF, but stage timings now make `compact_chunk_summary` +
+    `compact_prefix_combine` the larger remaining compact path. The next
+    bounded DPLR/WY experiment should reduce dense `start_states`
+    materialization/readback or fuse compact prefix metadata more deeply with
+    apply/output, while preserving chunk-level parallelism. Do not switch back
+    to wrapper-only optimization.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of
