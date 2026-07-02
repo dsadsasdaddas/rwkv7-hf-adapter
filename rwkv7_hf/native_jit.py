@@ -52,6 +52,8 @@ try:  # pragma: no cover - optional Triton fast path on CUDA hosts
         fused_recurrent_scan_clampw_available,
         fused_recurrent_scan_state_prep,
         fused_recurrent_scan_state_prep_available,
+        fused_recurrent_scan_state_prep_output_prepare,
+        fused_recurrent_scan_state_prep_output_prepare_available,
         fused_recurrent_scan_output_prepare,
         fused_recurrent_scan_output_prepare_available,
         fused_recurrent_update,
@@ -68,6 +70,8 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
             fused_recurrent_scan_clampw_available,
             fused_recurrent_scan_state_prep,
             fused_recurrent_scan_state_prep_available,
+            fused_recurrent_scan_state_prep_output_prepare,
+            fused_recurrent_scan_state_prep_output_prepare_available,
             fused_recurrent_scan_output_prepare,
             fused_recurrent_scan_output_prepare_available,
             fused_recurrent_update,
@@ -82,6 +86,8 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
         fused_recurrent_scan_clampw_available = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep = None  # type: ignore[assignment]
         fused_recurrent_scan_state_prep_available = None  # type: ignore[assignment]
+        fused_recurrent_scan_state_prep_output_prepare = None  # type: ignore[assignment]
+        fused_recurrent_scan_state_prep_output_prepare_available = None  # type: ignore[assignment]
         fused_recurrent_scan_output_prepare = None  # type: ignore[assignment]
         fused_recurrent_scan_output_prepare_available = None  # type: ignore[assignment]
         fused_recurrent_update = None  # type: ignore[assignment]
@@ -314,6 +320,22 @@ def _native_prefill_fused_state_scan_enabled() -> bool:
         return False
     try:
         return bool(fused_recurrent_scan_state_prep_available())
+    except Exception:
+        return False
+
+
+def _native_prefill_fused_state_scan_output_enabled() -> bool:
+    """Runtime switch for fused state-prep plus scan plus output-prep."""
+
+    if not env_flag("RWKV7_NATIVE_PREFILL_FUSED_STATE_SCAN_OUTPUT", False):
+        return False
+    if (
+        fused_recurrent_scan_state_prep_output_prepare is None
+        or fused_recurrent_scan_state_prep_output_prepare_available is None
+    ):
+        return False
+    try:
+        return bool(fused_recurrent_scan_state_prep_output_prepare_available())
     except Exception:
         return False
 
@@ -1147,13 +1169,59 @@ def prefill(
             g = F.linear(torch.sigmoid(F.linear(xg, g1)), g2)
             if layer_idx != 0:
                 v_gate = torch.sigmoid(v0 + F.linear(F.linear(xv, v1), v2))
-        use_fused_scan_output = _native_prefill_fused_scan_output_enabled()
-        use_clampw_scan = _native_prefill_fused_clampw_scan_enabled() and not use_fused_scan_output
-        use_fused_state_scan = _native_prefill_fused_state_scan_enabled() and not use_fused_scan_output
+        use_fused_state_scan_output = _native_prefill_fused_state_scan_output_enabled()
+        use_fused_scan_output = _native_prefill_fused_scan_output_enabled() and not use_fused_state_scan_output
+        use_clampw_scan = _native_prefill_fused_clampw_scan_enabled() and not use_fused_scan_output and not use_fused_state_scan_output
+        use_fused_state_scan = _native_prefill_fused_state_scan_enabled() and not use_fused_scan_output and not use_fused_state_scan_output
         if use_clampw_scan and _native_prefill_fused_state_prep_enabled() and fused_prefill_kv_kk_prep is None:
             use_clampw_scan = False
         state_scan_done = False
-        if use_fused_state_scan:
+        state_scan_output_done = False
+        if use_fused_state_scan_output:
+            state_scan_num_warps = _native_prefill_scan_num_warps(N, N)
+            if layer_idx == 0:
+                out, new_state = fused_recurrent_scan_state_prep_output_prepare(
+                    r.view(B, T, H, N),
+                    w.view(B, T, H, N),
+                    k.view(B, T, H, N),
+                    v.view(B, T, H, N),
+                    a.view(B, T, H, N),
+                    state[layer_idx],
+                    k_k,
+                    k_a,
+                    g.view(B, T, H, N),
+                    r_k,
+                    gn_w,
+                    gn_b,
+                    eps=eps,
+                    block_n=N,
+                    num_warps=state_scan_num_warps,
+                )
+                v_first_seq = v
+            else:
+                out, new_state = fused_recurrent_scan_state_prep_output_prepare(
+                    r.view(B, T, H, N),
+                    w.view(B, T, H, N),
+                    k.view(B, T, H, N),
+                    v.view(B, T, H, N),
+                    a.view(B, T, H, N),
+                    state[layer_idx],
+                    k_k,
+                    k_a,
+                    g.view(B, T, H, N),
+                    r_k,
+                    gn_w,
+                    gn_b,
+                    eps=eps,
+                    v_first=v_first_seq.view(B, T, H, N),
+                    v_gate=v_gate.view(B, T, H, N),
+                    block_n=N,
+                    num_warps=state_scan_num_warps,
+                )
+            out = out.reshape(B, T, hidden)
+            state_scan_done = True
+            state_scan_output_done = True
+        elif use_fused_state_scan:
             state_scan_block_m = _native_prefill_scan_block_m(N)
             state_scan_num_warps = _native_prefill_scan_num_warps(N, state_scan_block_m)
             if layer_idx == 0:
@@ -1253,7 +1321,9 @@ def prefill(
             if not use_clampw_scan:
                 w = torch.exp(-0.606531 * torch.sigmoid(w.float()))
 
-        if use_fused_scan_output:
+        if use_fused_state_scan_output:
+            pass
+        elif use_fused_scan_output:
             out, new_state = fused_recurrent_scan_output_prepare(
                 r.view(B, T, H, N),
                 w.view(B, T, H, N),
@@ -1273,7 +1343,7 @@ def prefill(
         elif not state_scan_done:
             out, new_state = _native_prefill_scan(r, w, k, v, kk, a, state[layer_idx], B, T, H, N, w_is_raw=use_clampw_scan)
         out_projected = False
-        if use_fused_scan_output:
+        if state_scan_output_done or use_fused_scan_output:
             pass
         elif _native_prefill_fused_output_project_enabled():
             out = fused_attn_output_project(

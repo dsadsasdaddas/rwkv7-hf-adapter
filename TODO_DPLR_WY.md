@@ -79,16 +79,45 @@ Branch: `wangyue/native-prefill-060-albatross`
   - conclusion: keep the split-row state-scan path as an experimental knob for
     other cards/shapes, but do not make it the 4090 default. Current best
     confirmed path remains full-head fused state-scan with `8` warps.
-- [ ] Next experiment should target the real dominant path:
+- [x] Correct the 4090 harness and re-run current-branch rows:
+  - issue found: `/workspace/activate_rwkv7.sh` runs
+    `cd /workspace/rwkv7-hf-adapter` and prepends that older checkout to
+    `PYTHONPATH`. Correct 4090 commands must now use:
+    `source /workspace/activate_rwkv7.sh && cd /workspace/projects/rwkv7-hf-adapter-060 && export PYTHONPATH=.`
+  - corrected result files:
+    - `bench/results_4090_prefill060_corrected_state_scan_output_20260702_203712.jsonl`
+    - `bench/results_4090_prefill060_corrected_confirm_20260702_203852.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_060_corrected_state_scan_output_20260702_203712.jsonl`
+    - `/tmp/native_4090_060_corrected_confirm_20260702_203852.jsonl`
+  - corrected current-branch rows, all pass greedy/cache smoke:
+    - full-head state-scan + fused output: best confirm
+      `26,395.7 tok/s`, `19.3971 ms`, about `0.5062x` Albatross
+    - split-row `block_m=8,w4`: `25,324.1 tok/s`, about `0.4856x`
+    - larger state-scan+output-prep fusion `w4`: `23,810.4 tok/s`,
+      about `0.4566x`
+    - larger state-scan+output-prep fusion `w8`: `23,609.2 tok/s`,
+      about `0.4527x`
+  - conclusion: the larger fused state-scan+output-prep kernel is correct but
+    slower on 4090, so keep it opt-in and do not promote it. The corrected
+    current-branch performance evidence supersedes rows produced with the
+    wrong activate/cwd order.
+- [x] Next experiment should target the real dominant path:
   - first choice: optimize/specialize `fused_recurrent_scan_state_prep` itself
     for 4090/Ada 0.4B `H=16,N=64,T=512`, because it is now over half of the
     profiled component time;
   - second choice: one larger fused attention-prep kernel that combines
     norm/shift-mix + dense R/K/V + W/A/G/V LoRA + state-scan boundary, rather
     than enabling standalone fused WAVG-LoRA or standalone fused shift-mix.
+- [ ] Next corrected-harness experiment:
+  - profile the corrected full-head `block_m=64,w8` current-branch path again
+    to refresh the real top components after the activate/cwd fix;
+  - then either reduce `fused_recurrent_scan_state_prep` internal cost or fuse
+    a deeper pre-scan projection/LoRA boundary. Do not promote the current
+    larger state-scan+output-prep kernel.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
-  `27,173.3 tok/s` (`~0.5211x`), still about `15.1%` short of the stretch.
+  `26,395.7 tok/s` (`~0.5062x`), still about `18.5%` short of the stretch.
 
 ## Temporary TODO: next 4090 push
 
