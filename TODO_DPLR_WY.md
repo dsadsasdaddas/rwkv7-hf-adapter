@@ -473,16 +473,52 @@ Branch: `wangyue/native-prefill-060-albatross`
     `0.60x` Albatross stretch. Keep it opt-in. The useful signal is that vector
     prep duplication is real, but it needs a lower-traffic/persistent schedule
     rather than a naive temp-tensor precompute stage.
+- [x] Try reduced-temp CUDA precompute mode for the row-block register-state
+  path:
+  - added `RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_PRECOMPUTE_MODE=wk` as a
+    second precompute variant. `full` keeps the previous four-fp32-temp
+    implementation; `wk` precomputes only W decay and normalized KK as fp32
+    temps, while adjusted K/V are written to and consumed from the existing
+    fp16 output tensors.
+  - implementation:
+    - new `rwkv7_state_scan_prep_n64_vector_precompute_wk_kernel` computes
+      W decay, normalized KK, fp16 adjusted K, and fp16 adjusted V once per
+      `(batch, token, head)`.
+    - new `rwkv7_state_scan_prep_n64_rowblock_precomputed_wk_kernel` keeps
+      row state in registers and consumes fp32 W/KK plus fp16 K/V. This tests
+      whether the prior full-precompute path was mainly losing to temp tensor
+      traffic.
+    - telemetry now records `prefill_cuda_state_scan_precompute_mode`.
+  - validation result files:
+    - `bench/results_4090_prefill060_cuda_state_scan_precompute_wk_smoke_20260703_014100.jsonl`
+    - `bench/results_4090_prefill060_cuda_state_scan_precompute_wk_confirm_20260703_014420.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_cuda_state_scan_precompute_wk_smoke_20260703_014100.jsonl`
+    - `/tmp/native_4090_cuda_state_scan_precompute_wk_confirm_20260703_014420.jsonl`
+  - rows all pass greedy/cache smoke:
+    - smoke baseline Triton: `24,781.9 tok/s`.
+    - smoke row-block no-precompute: `25,897.6 tok/s`.
+    - smoke full precompute: `25,057.0 tok/s`.
+    - smoke reduced-temp `wk`: `25,361.3 tok/s`, peak `990.2 MiB`.
+    - confirm baseline Triton: `25,218.6 tok/s`.
+    - confirm row-block no-precompute: `26,667.1 tok/s`.
+    - confirm reduced-temp `wk`: `25,568.4 tok/s`, peak `990.2 MiB`,
+      max diff `0.0625`.
+  - conclusion: reduced-temp `wk` is correctness-safe and uses less extra VRAM
+    than full precompute, but it is still slower than recomputing vectors
+    inside the row-block path on this 4090 shape. The bottleneck is not fixed
+    by materializing fewer temp tensors; the next useful step is not another
+    global-memory precompute variant, but a cooperative/persistent schedule
+    that shares vector prep without writing it to global memory.
 - [ ] Next corrected-harness experiment:
-  - CUDA rowgroup, row-block, and two-stage precompute testing narrowed the
-    remaining credible path: keep the register-row state layout, but avoid the
-    naive precompute path's extra global temp traffic. The next concrete CUDA
-    task should try either (a) a cooperative persistent head-level schedule
-    where one block/cluster shares vector prep while row state stays in
-    registers, or (b) a reduced-temp row-block path that precomputes only the
-    expensive normalized KK / W decay and keeps K/V in the existing fp16 output
-    tensors. Do not promote wrapper/projection fusion or the current rowgroup,
-    row-block, or naive precompute scaffolds.
+  - CUDA rowgroup, row-block, full precompute, and reduced-temp precompute
+    testing narrowed the remaining credible path: keep the register-row state
+    layout, but share vector prep without writing another set of global temp
+    tensors. The next concrete CUDA task should be a cooperative/persistent
+    head-level schedule where one block/cluster computes W/K/V/A/KK prep once
+    and row workers consume it from shared/register exchange while row state
+    stays in registers. Do not promote wrapper/projection fusion or the current
+    rowgroup, row-block, full-precompute, or reduced-temp scaffolds.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of

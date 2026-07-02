@@ -389,6 +389,24 @@ def _native_prefill_cuda_state_scan_precompute_enabled() -> bool:
     return env_flag("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_PRECOMPUTE", False)
 
 
+def _native_prefill_cuda_state_scan_precompute_mode() -> str:
+    """Vector precompute variant for the experimental CUDA row-block scan."""
+
+    if not _native_prefill_cuda_state_scan_precompute_enabled():
+        return "none"
+    value = os.environ.get("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_PRECOMPUTE_MODE", "full")
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode in {"1", "true", "yes", "on", "full"}:
+        return "full"
+    if mode in {"2", "wk", "wkk", "w_kk", "reduced", "reduced_temp", "wk_fp16kv", "fp16kv"}:
+        return "wk"
+    if mode in {"0", "false", "no", "off", "none"}:
+        return "none"
+    raise ValueError(
+        "RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN_PRECOMPUTE_MODE must be one of full, wk/reduced_temp, or none"
+    )
+
+
 def _native_prefill_fused_shift_mix_enabled() -> bool:
     """Runtime switch for prefill attention shift-mix fusion telemetry."""
 
@@ -1608,6 +1626,9 @@ def prefill(
             cuda_state_scan_precompute = (
                 _native_prefill_cuda_state_scan_precompute_enabled() if use_cuda_state_scan else False
             )
+            cuda_state_scan_precompute_mode = (
+                _native_prefill_cuda_state_scan_precompute_mode() if use_cuda_state_scan else "none"
+            )
             if use_cuda_state_scan and layer_idx == 0:
                 out, new_state, k, v = cuda_state_scan_prep(
                     r.view(B, T, H, N),
@@ -1620,6 +1641,7 @@ def prefill(
                     k_a,
                     lanes_per_row=cuda_state_scan_lanes,
                     precompute_vector=cuda_state_scan_precompute,
+                    precompute_mode=cuda_state_scan_precompute_mode,
                 )
                 v_first_seq = v.reshape(B, T, hidden)
             elif use_cuda_state_scan:
@@ -1636,6 +1658,7 @@ def prefill(
                     v_gate=v_gate.view(B, T, H, N),
                     lanes_per_row=cuda_state_scan_lanes,
                     precompute_vector=cuda_state_scan_precompute,
+                    precompute_mode=cuda_state_scan_precompute_mode,
                 )
             elif layer_idx == 0:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(
