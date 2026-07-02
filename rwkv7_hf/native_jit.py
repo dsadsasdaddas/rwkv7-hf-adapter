@@ -113,6 +113,15 @@ except Exception:  # pragma: no cover - direct remote-file execution fallback
     except Exception:
         dplr_chunk_scan = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - optional CUDA extension prototype
+    from .cuda_state_scan import cuda_state_scan_prep, cuda_state_scan_prep_available
+except Exception:  # pragma: no cover - direct remote-file execution fallback
+    try:
+        from cuda_state_scan import cuda_state_scan_prep, cuda_state_scan_prep_available
+    except Exception:
+        cuda_state_scan_prep = None  # type: ignore[assignment]
+        cuda_state_scan_prep_available = None  # type: ignore[assignment]
+
 try:  # pragma: no cover - optional Triton fast path on CUDA hosts
     from .fused_output import (
         fused_attn_output_prepare,
@@ -325,6 +334,19 @@ def _native_prefill_scan_nomask64_enabled() -> bool:
     """Use the specialized unmasked full-head scan for head_dim=64."""
 
     return env_flag("RWKV7_NATIVE_PREFILL_SCAN_NOMASK64", False)
+
+
+def _native_prefill_cuda_state_scan_enabled() -> bool:
+    """Runtime switch for the experimental CUDA N=64 state-scan prototype."""
+
+    if not env_flag("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN", False):
+        return False
+    if cuda_state_scan_prep is None or cuda_state_scan_prep_available is None:
+        return False
+    try:
+        return bool(cuda_state_scan_prep_available())
+    except Exception:
+        return False
 
 
 def _native_prefill_fused_shift_mix_enabled() -> bool:
@@ -1536,7 +1558,38 @@ def prefill(
             state_scan_num_stages = _native_prefill_scan_num_stages()
             state_scan_algebraic_output = _native_prefill_scan_algebraic_output_enabled()
             state_scan_nomask64 = _native_prefill_scan_nomask64_enabled()
-            if layer_idx == 0:
+            use_cuda_state_scan = (
+                _native_prefill_cuda_state_scan_enabled()
+                and N == 64
+                and state_scan_block_m == 64
+                and x.dtype == torch.float16
+            )
+            if use_cuda_state_scan and layer_idx == 0:
+                out, new_state, k, v = cuda_state_scan_prep(
+                    r.view(B, T, H, N),
+                    w.view(B, T, H, N),
+                    k.view(B, T, H, N),
+                    v.view(B, T, H, N),
+                    a.view(B, T, H, N),
+                    state[layer_idx],
+                    k_k,
+                    k_a,
+                )
+                v_first_seq = v.reshape(B, T, hidden)
+            elif use_cuda_state_scan:
+                out, new_state, k, v = cuda_state_scan_prep(
+                    r.view(B, T, H, N),
+                    w.view(B, T, H, N),
+                    k.view(B, T, H, N),
+                    v.view(B, T, H, N),
+                    a.view(B, T, H, N),
+                    state[layer_idx],
+                    k_k,
+                    k_a,
+                    v_first=v_first_seq.view(B, T, H, N),
+                    v_gate=v_gate.view(B, T, H, N),
+                )
+            elif layer_idx == 0:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(
                     r.view(B, T, H, N),
                     w.view(B, T, H, N),

@@ -557,8 +557,38 @@ def profiled_native_prefill(
             state_scan_num_stages = native_jit._native_prefill_scan_num_stages()
             state_scan_algebraic_output = native_jit._native_prefill_scan_algebraic_output_enabled()
             state_scan_nomask64 = native_jit._native_prefill_scan_nomask64_enabled()
+            use_cuda_state_scan = (
+                getattr(native_jit, "_native_prefill_cuda_state_scan_enabled", lambda: False)()
+                and N == 64
+                and state_scan_block_m == 64
+                and h.dtype == torch.float16
+            )
 
             def state_scan():
+                if use_cuda_state_scan and layer_idx == 0:
+                    return native_jit.cuda_state_scan_prep(
+                        r.view(B, T, H, N),
+                        w.view(B, T, H, N),
+                        k.view(B, T, H, N),
+                        v.view(B, T, H, N),
+                        a.view(B, T, H, N),
+                        state[layer_idx],
+                        k_k,
+                        k_a,
+                    )
+                if use_cuda_state_scan:
+                    return native_jit.cuda_state_scan_prep(
+                        r.view(B, T, H, N),
+                        w.view(B, T, H, N),
+                        k.view(B, T, H, N),
+                        v.view(B, T, H, N),
+                        a.view(B, T, H, N),
+                        state[layer_idx],
+                        k_k,
+                        k_a,
+                        v_first=v_first_seq.view(B, T, H, N),
+                        v_gate=v_gate.view(B, T, H, N),
+                    )
                 if layer_idx == 0:
                     return native_jit.fused_recurrent_scan_state_prep(
                         r.view(B, T, H, N),
@@ -595,7 +625,8 @@ def profiled_native_prefill(
                     nomask64=state_scan_nomask64,
                 )
 
-            out, new_state, k, v = profiler.measure("recurrent_scan_state_prep_fused", state_scan)
+            component_name = "recurrent_scan_state_prep_cuda" if use_cuda_state_scan else "recurrent_scan_state_prep_fused"
+            out, new_state, k, v = profiler.measure(component_name, state_scan)
             out = out.reshape(B, T, hidden)
             k = k.reshape(B, T, hidden)
             v = v.reshape(B, T, hidden)
@@ -889,6 +920,8 @@ def run_case(args: argparse.Namespace, tok, model, batch_size: int, prompt_token
         "scan_num_stages": scan_num_stages(),
         "scan_algebraic_output": scan_algebraic_output(),
         "scan_nomask64": scan_nomask64(),
+        "prefill_cuda_state_scan_requested": os.environ.get("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN", "0").lower() not in {"0", "false", "no", "off"},
+        "prefill_cuda_state_scan_effective": getattr(native_jit, "_native_prefill_cuda_state_scan_enabled", lambda: False)(),
         "fine_attention_breakdown": bool(args.fine_attn),
         "prefill_fused_scan_output_requested": os.environ.get("RWKV7_NATIVE_PREFILL_FUSED_SCAN_OUTPUT", "0").lower() not in {"0", "false", "no", "off"},
         "prefill_fused_scan_output_effective": native_jit._native_prefill_fused_scan_output_enabled(),

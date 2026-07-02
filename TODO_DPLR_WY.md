@@ -301,6 +301,35 @@ Branch: `wangyue/native-prefill-060-albatross`
     Keep it disabled by default. This further narrows the remaining path to a
     real state-layout/CUDA-persistent rewrite instead of another small Triton
     full-head specialization.
+- [x] Start the dedicated CUDA state-scan path with a minimal shared-state
+  prototype:
+  - added opt-in `RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN=1`.
+  - implementation:
+    - `rwkv7_hf/cuda_state_scan.py` JIT-builds a CUDA extension through
+      `torch.utils.cpp_extension.load_inline`.
+    - current kernel target is deliberately narrow: fp16, `head_dim=64`, one
+      CUDA block per `(batch, head)`, 64 threads, full `[64,64]` state kept in
+      shared memory, and raw W/K/V/A state prep plus recurrent scan in CUDA.
+    - native prefill can route the existing fused state-scan branch through
+      this CUDA prototype; benchmark/profiler/analyzer telemetry records
+      `prefill_cuda_state_scan_*`.
+    - default HF/native behavior stays unchanged unless the env flag is set.
+  - validation result files:
+    - `bench/results_4090_prefill060_cuda_state_scan_smoke_20260703_002059.jsonl`
+    - `bench/results_4090_prefill060_cuda_state_scan_confirm_20260703_002141.jsonl`
+  - remote row sources:
+    - `/tmp/native_4090_cuda_state_scan_smoke_20260703_002059.jsonl`
+    - `/tmp/native_4090_cuda_state_scan_confirm_20260703_002141.jsonl`
+  - confirmation rows, both pass greedy/cache smoke:
+    - current Triton baseline full-head state-scan + fused output:
+      `25,883.4 tok/s`, `19.7810 ms`, about `0.4963x` Albatross.
+    - CUDA shared-state prototype: `10,547.6 tok/s`, `48.5417 ms`, about
+      `0.2023x` Albatross, max diff `0.0625`.
+  - conclusion: the CUDA route now has a correctness-passing repo scaffold, but
+    the naive one-block/shared-state implementation is far slower than Triton.
+    This is still useful because it validates the integration/build path and
+    gives the next CUDA task a concrete target: increase parallelism and reduce
+    per-token global/shared synchronization, not promote this first kernel.
 - [ ] Next corrected-harness experiment:
   - remaining credible path is no longer wrapper/projection fusion. Target the
     internal full-head `fused_recurrent_scan_state_prep` kernel itself, likely

@@ -1,0 +1,317 @@
+# coding=utf-8
+"""Optional CUDA state-scan prototypes for RWKV-7 native prefill.
+
+This module is intentionally experimental.  It JIT-builds a tiny CUDA extension
+for the current 4090 target shape (head_dim=64) so we can compare a real CUDA
+state-layout baseline against the Triton full-head scan before committing to a
+larger persistent-kernel rewrite.
+"""
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Any
+
+try:  # pragma: no cover - optional on CPU-only hosts
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+
+std::vector<torch::Tensor> rwkv7_state_scan_prep_forward_cuda(
+    torch::Tensor r,
+    torch::Tensor w_raw,
+    torch::Tensor k_raw,
+    torch::Tensor v_raw,
+    torch::Tensor a,
+    torch::Tensor state,
+    torch::Tensor k_k,
+    torch::Tensor k_a,
+    torch::Tensor v_first,
+    torch::Tensor v_gate,
+    bool has_v_gate);
+
+std::vector<torch::Tensor> state_scan_prep_forward(
+    torch::Tensor r,
+    torch::Tensor w_raw,
+    torch::Tensor k_raw,
+    torch::Tensor v_raw,
+    torch::Tensor a,
+    torch::Tensor state,
+    torch::Tensor k_k,
+    torch::Tensor k_a,
+    torch::Tensor v_first,
+    torch::Tensor v_gate,
+    bool has_v_gate) {
+  return rwkv7_state_scan_prep_forward_cuda(
+      r, w_raw, k_raw, v_raw, a, state, k_k, k_a, v_first, v_gate, has_v_gate);
+}
+"""
+
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/util/Half.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+#ifndef CHECK_CUDA
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#endif
+#ifndef CHECK_CONTIGUOUS
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#endif
+#ifndef CHECK_INPUT
+#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+#endif
+
+template <typename scalar_t>
+__global__ void rwkv7_state_scan_prep_n64_kernel(
+    const scalar_t* __restrict__ r,
+    const scalar_t* __restrict__ w_raw,
+    const scalar_t* __restrict__ k_raw,
+    const scalar_t* __restrict__ v_raw,
+    const scalar_t* __restrict__ a,
+    const float* __restrict__ state,
+    const scalar_t* __restrict__ k_k,
+    const scalar_t* __restrict__ k_a,
+    const scalar_t* __restrict__ v_first,
+    const scalar_t* __restrict__ v_gate,
+    scalar_t* __restrict__ out,
+    float* __restrict__ final_state,
+    scalar_t* __restrict__ k_out,
+    scalar_t* __restrict__ v_out,
+    int B,
+    int T,
+    int H,
+    bool has_v_gate) {
+  constexpr int N = 64;
+  const int bh = blockIdx.x;
+  const int head = bh % H;
+  const int batch = bh / H;
+  const int tid = threadIdx.x;
+
+  __shared__ float st[N * N];
+  __shared__ float r_s[N];
+  __shared__ float w_s[N];
+  __shared__ float k_s[N];
+  __shared__ float v_s[N];
+  __shared__ float a_s[N];
+  __shared__ float kk_s[N];
+  __shared__ float norm_inv_s;
+
+  const int state_base = (batch * H + head) * N * N;
+  for (int idx = tid; idx < N * N; idx += blockDim.x) {
+    st[idx] = state[state_base + idx];
+  }
+  __syncthreads();
+
+  const int param_base = head * N;
+  for (int t = 0; t < T; ++t) {
+    const int vec_base = ((batch * T + t) * H + head) * N;
+    if (tid < N) {
+      const float rv = static_cast<float>(r[vec_base + tid]);
+      const float wr = static_cast<float>(w_raw[vec_base + tid]);
+      const float kr = static_cast<float>(k_raw[vec_base + tid]);
+      const float vr = static_cast<float>(v_raw[vec_base + tid]);
+      const float av = static_cast<float>(a[vec_base + tid]);
+      const float kk_raw = kr * static_cast<float>(k_k[param_base + tid]);
+      r_s[tid] = rv;
+      w_s[tid] = __expf(-0.606531f / (1.0f + __expf(-wr)));
+      a_s[tid] = av;
+      kk_s[tid] = kk_raw;
+      k_s[tid] = kr * (1.0f + (av - 1.0f) * static_cast<float>(k_a[param_base + tid]));
+      if (has_v_gate) {
+        const float vf = static_cast<float>(v_first[vec_base + tid]);
+        const float vg = static_cast<float>(v_gate[vec_base + tid]);
+        v_s[tid] = vr + (vf - vr) * vg;
+      } else {
+        v_s[tid] = vr;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float norm2 = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < N; ++j) {
+        norm2 += kk_s[j] * kk_s[j];
+      }
+      norm_inv_s = rsqrtf(fmaxf(norm2, 1.0e-20f));
+    }
+    __syncthreads();
+
+    if (tid < N) {
+      kk_s[tid] *= norm_inv_s;
+    }
+    __syncthreads();
+
+    if (tid < N) {
+      const int row = tid;
+      float state_dot_kk = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < N; ++j) {
+        state_dot_kk += st[row * N + j] * kk_s[j];
+      }
+
+      float recurrent = 0.0f;
+      const float v_row = v_s[row];
+      #pragma unroll
+      for (int j = 0; j < N; ++j) {
+        const float new_st = st[row * N + j] * w_s[j]
+            + v_row * k_s[j]
+            - state_dot_kk * kk_s[j] * a_s[j];
+        st[row * N + j] = new_st;
+        recurrent += new_st * r_s[j];
+      }
+      out[vec_base + row] = static_cast<scalar_t>(recurrent);
+      k_out[vec_base + row] = static_cast<scalar_t>(k_s[row]);
+      v_out[vec_base + row] = static_cast<scalar_t>(v_s[row]);
+    }
+    __syncthreads();
+  }
+
+  for (int idx = tid; idx < N * N; idx += blockDim.x) {
+    final_state[state_base + idx] = st[idx];
+  }
+}
+
+std::vector<torch::Tensor> rwkv7_state_scan_prep_forward_cuda(
+    torch::Tensor r,
+    torch::Tensor w_raw,
+    torch::Tensor k_raw,
+    torch::Tensor v_raw,
+    torch::Tensor a,
+    torch::Tensor state,
+    torch::Tensor k_k,
+    torch::Tensor k_a,
+    torch::Tensor v_first,
+    torch::Tensor v_gate,
+    bool has_v_gate) {
+  CHECK_INPUT(r);
+  CHECK_INPUT(w_raw);
+  CHECK_INPUT(k_raw);
+  CHECK_INPUT(v_raw);
+  CHECK_INPUT(a);
+  CHECK_INPUT(state);
+  CHECK_INPUT(k_k);
+  CHECK_INPUT(k_a);
+  if (has_v_gate) {
+    CHECK_INPUT(v_first);
+    CHECK_INPUT(v_gate);
+  }
+  TORCH_CHECK(r.dim() == 4, "r must be [B,T,H,N]");
+  TORCH_CHECK(state.dim() == 4, "state must be [B,H,N,N]");
+  const int B = static_cast<int>(r.size(0));
+  const int T = static_cast<int>(r.size(1));
+  const int H = static_cast<int>(r.size(2));
+  const int N = static_cast<int>(r.size(3));
+  TORCH_CHECK(N == 64, "CUDA prototype only supports head_dim=64");
+  TORCH_CHECK(state.size(0) == B && state.size(1) == H && state.size(2) == 64 && state.size(3) == 64,
+              "state shape mismatch");
+  TORCH_CHECK(state.scalar_type() == torch::kFloat32, "state must be fp32");
+  TORCH_CHECK(r.scalar_type() == torch::kFloat16, "CUDA prototype currently supports fp16 only");
+  TORCH_CHECK(w_raw.scalar_type() == r.scalar_type() && k_raw.scalar_type() == r.scalar_type() &&
+              v_raw.scalar_type() == r.scalar_type() && a.scalar_type() == r.scalar_type() &&
+              k_k.scalar_type() == r.scalar_type() && k_a.scalar_type() == r.scalar_type(),
+              "all vector inputs must match r dtype");
+
+  auto out = torch::empty_like(r);
+  auto final_state = torch::empty_like(state);
+  auto k_out = torch::empty_like(k_raw);
+  auto v_out = torch::empty_like(v_raw);
+
+  const dim3 grid(B * H);
+  const dim3 block(64);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  rwkv7_state_scan_prep_n64_kernel<at::Half><<<grid, block, 0, stream>>>(
+      r.data_ptr<at::Half>(),
+      w_raw.data_ptr<at::Half>(),
+      k_raw.data_ptr<at::Half>(),
+      v_raw.data_ptr<at::Half>(),
+      a.data_ptr<at::Half>(),
+      state.data_ptr<float>(),
+      k_k.data_ptr<at::Half>(),
+      k_a.data_ptr<at::Half>(),
+      has_v_gate ? v_first.data_ptr<at::Half>() : v_raw.data_ptr<at::Half>(),
+      has_v_gate ? v_gate.data_ptr<at::Half>() : v_raw.data_ptr<at::Half>(),
+      out.data_ptr<at::Half>(),
+      final_state.data_ptr<float>(),
+      k_out.data_ptr<at::Half>(),
+      v_out.data_ptr<at::Half>(),
+      B, T, H, has_v_gate);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, final_state, k_out, v_out};
+}
+"""
+
+
+@lru_cache(maxsize=1)
+def _load_extension():
+    if torch is None:
+        raise RuntimeError("cuda_state_scan requires torch")
+    from torch.utils.cpp_extension import load_inline
+
+    return load_inline(
+        name="rwkv7_cuda_state_scan_v1",
+        cpp_sources=_CPP_SRC,
+        cuda_sources=_CUDA_SRC,
+        functions=["state_scan_prep_forward"],
+        with_cuda=True,
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        verbose=False,
+    )
+
+
+def cuda_state_scan_prep_available() -> bool:
+    return bool(torch is not None and torch.cuda.is_available())
+
+
+def cuda_state_scan_prep(
+    r: Any,
+    w_raw: Any,
+    k_raw: Any,
+    v_raw: Any,
+    a: Any,
+    state: Any,
+    k_k: Any,
+    k_a: Any,
+    *,
+    v_first: Any | None = None,
+    v_gate: Any | None = None,
+):
+    """Run the experimental CUDA N=64 state-prep scan.
+
+    All sequence tensors must be contiguous `[B,T,H,64]` fp16 CUDA tensors and
+    `state` must be `[B,H,64,64]` fp32.  Returns `(out, final_state, k, v)`.
+    """
+
+    if torch is None:
+        raise RuntimeError("cuda_state_scan_prep requires torch")
+    if int(r.shape[-1]) != 64:
+        raise ValueError("cuda_state_scan_prep only supports head_dim=64")
+    if r.dtype is not torch.float16:
+        raise ValueError("cuda_state_scan_prep currently supports fp16 only")
+    has_v_gate = v_first is not None and v_gate is not None
+    if not has_v_gate:
+        v_first = v_raw
+        v_gate = v_raw
+    ext = _load_extension()
+    out, final_state, k_out, v_out = ext.state_scan_prep_forward(
+        r.contiguous(),
+        w_raw.contiguous(),
+        k_raw.contiguous(),
+        v_raw.contiguous(),
+        a.contiguous(),
+        state.contiguous(),
+        k_k.reshape(-1).contiguous(),
+        k_a.reshape(-1).contiguous(),
+        v_first.contiguous(),
+        v_gate.contiguous(),
+        bool(has_v_gate),
+    )
+    return out, final_state, k_out, v_out
