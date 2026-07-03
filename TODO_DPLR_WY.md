@@ -969,13 +969,67 @@ Branch: `wangyue/native-prefill-060-albatross`
       - conclusion: keep fused WAVG-LoRA opt-in and tuned setting recorded,
         but do not promote it as a default because it does not approach the
         strict best mainline row (`27,051.0 tok/s`) or the `0.60x` target.
-- [ ] Next main fused-fp16 task:
+- [x] Next main fused-fp16 task:
   - Stop spending iterations on W precompute or shallow WAVG-LoRA tuning.
     The next `0.60x` attempt should target the actual remaining scan
     state-layout/readout work: either a stronger full-head state-scan phase
     probe that isolates state-dot/update/readout costs in the Triton path, or
     a CUDA/persistent row-register schedule that improves on the previous
     row-block near-parity result without adding global temp precompute.
+  - Done: added a stronger full-head Triton state-scan phase probe for the
+    current main fused fp16 path.
+    - implementation:
+      - new synthetic helper
+        `fused_recurrent_scan_state_prep_phase_probe(...)` times cumulative
+        phases of the full-head `fused_recurrent_scan_state_prep` loop;
+      - new benchmark `bench/bench_fused_state_scan_micro.py` records
+        `triton_state_scan_micro` rows;
+      - analyzer now preserves the Triton full-head micro rows and adds their
+        component estimates to `next_focus`;
+      - default HF/native behavior is unchanged.
+    - result files:
+      - Triton micro:
+        `bench/results_triton_state_scan_micro_4090_20260703_003443.jsonl`
+        from remote `/tmp/triton_state_scan_micro_4090_20260703_003443.jsonl`;
+      - HF smoke after adding the probe:
+        `bench/results_native_4090_after_triton_micro_smoke_20260703_003717.jsonl`
+        from remote
+        `/tmp/native_4090_after_triton_micro_smoke_20260703_003717.jsonl`.
+    - 4090 synthetic full-head scan micro, `B=1,T=512,H=16,N=64,fp16`,
+      `num_warps=8,num_stages=3`:
+      - phase 0 prep/K-normalization/KV/W: `0.334848 ms`;
+      - phase 1 plus state-dot-KK: `0.476160 ms`;
+      - phase 2 plus state update: `0.504832 ms`;
+      - phase 3 plus recurrent output: `0.549792 ms`;
+      - normal full fused helper: `0.515072 ms`;
+      - component estimate:
+        `{prep_norm_kv_w: 0.334848 ms, state_dot: 0.141312 ms,
+        state_update: 0.028672 ms, recurrent_output: 0.044960 ms,
+        phase3_vs_full: 0.034720 ms}`.
+    - correctness:
+      - phase 3 matches the normal full-head helper exactly for synthetic
+        outputs, final state, adjusted K, and adjusted V (`max_abs_diff=0.0`
+        for all four).
+      - corrected 4090 HF smoke still passes after adding the probe:
+        `25,008.6 tok/s`, `20.4730 ms`, peak `989.2 MiB`,
+        `max_abs_diff=0.0625`, greedy/cache/decode smoke pass.
+    - conclusion: the earlier W-only precompute boundary was too narrow.  The
+      actual full-head Triton scan signal says combined vector prep,
+      K-normalization, K/V writeback, and W decay dominate the synthetic
+      kernel, with state-dot-KK as the next visible cost; update/readout are
+      smaller.  The next mainline experiment should reduce this prep/norm/KV
+      phase without global temp tensors, or revisit the CUDA row-register
+      path with a persistent/cooperative schedule that shares those vectors
+      while retaining enough parallelism.
+- [ ] Next main fused-fp16 task:
+  - Use the new full-head phase evidence rather than another W-only or shallow
+    LoRA boundary.  The next bounded experiment should target the dominant
+    `prep_norm_kv_w` + state-dot region directly.  Candidate directions:
+    - a Triton variant that keeps adjusted K/V local and fuses the needed
+      correction/output consumer so K/V global writeback does not dominate; or
+    - a CUDA row-register/persistent schedule that shares R/W/K/A/KK/V prep
+      once per token/head without materializing fp32 temp tensors or losing the
+      row-block parallelism that made the previous CUDA row-block near parity.
   - Same-run gate remains: compare against fused recurrent scan + fused output
     baseline on 4090 / 0.4B / prompt512 / bsz1, preserve greedy/cache/decode
     smoke, and only promote if it moves toward `>=31,289 tok/s`.

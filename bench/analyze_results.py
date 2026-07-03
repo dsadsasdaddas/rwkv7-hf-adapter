@@ -373,6 +373,19 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             r.get("rows_per_block"),
         ),
     )
+    triton_state_scan_micro = latest_by_key(
+        [r for r in rows if r.get("axis") == "triton_state_scan_micro" and r.get("backend") == "fused_recurrent_update"],
+        lambda r: (
+            r.get("bench_case"),
+            r.get("batch_size"),
+            r.get("seq_len"),
+            r.get("heads"),
+            r.get("head_dim"),
+            r.get("num_warps"),
+            r.get("num_stages"),
+            r.get("phase"),
+        ),
+    )
     micro = latest(rows, lambda r: r.get("axis") == "decode_micro" and r.get("backend") == "hf_adapter")
     forward_fast_path = latest(rows, lambda r: r.get("axis") == "forward_fast_path" and r.get("backend") == "hf_adapter")
     generate_fast_path = latest(rows, lambda r: r.get("axis") == "generate_fast_path" and r.get("backend") == "hf_adapter")
@@ -1527,6 +1540,18 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     f"full_phase={cuda_micro_summary.get('cuda_ms')}ms "
                     f"components={components}; use as direction signal, not HF promotion proof"
                 )
+            triton_micro_summary = next(
+                (r for r in triton_state_scan_micro if r.get("bench_case") == "fullhead_phase_delta_summary"),
+                None,
+            )
+            if triton_micro_summary:
+                components = triton_micro_summary.get("component_ms_estimate") or {}
+                focus.append(
+                    "Triton full-head state-scan micro row present: "
+                    f"phase3={triton_micro_summary.get('triton_ms')}ms "
+                    f"full={triton_micro_summary.get('full_fused_ms')}ms "
+                    f"components={components}; use as the next state-layout/readout direction signal"
+                )
             warp_rows = [
                 r
                 for r in native_prefill_scan
@@ -2336,6 +2361,10 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             compact(r, ["_lineno", "status", "device", "dtype", "batch_size", "seq_len", "heads", "head_dim", "tokens_total", "bench_case", "phase", "phase_name", "schedule", "rows_per_block", "cuda_ms", "tokps_total", "component_ms_estimate"])
             for r in cuda_state_scan_micro
         ],
+        "triton_state_scan_micro": [
+            compact(r, ["_lineno", "status", "device", "dtype", "batch_size", "seq_len", "heads", "head_dim", "tokens_total", "bench_case", "phase", "phase_name", "num_warps", "num_stages", "triton_ms", "full_fused_ms", "tokps_total", "component_ms_estimate", "phase3_out_max_abs_diff", "phase3_state_max_abs_diff", "phase3_k_max_abs_diff", "phase3_v_max_abs_diff"])
+            for r in triton_state_scan_micro
+        ],
         "decode_micro": compact(micro, ["_lineno", "fast_decode_api_name", "fast_token_layout", "fast_token_backend", "fast_token_backend_effective", "hf_forward_fixed", "hf_forward_greedy", "hf_forward_auto_fixed", "hf_forward_auto_greedy", "hf_forward_auto_backend", "fast_decode_fixed", "fast_decode_greedy", "norm_lm_head", "lm_head", "argmax", "empty_loop", "peak_vram_mb"]),
         "forward_fast_path": compact(forward_fast_path, ["_lineno", "fast_token_backend", "fast_token_layout", "reference_forward", "hf_forward_fast", "direct_fast_token", "hf_forward_fast_backend", "direct_fast_token_backend", "max_abs_diff_auto_vs_reference", "max_abs_diff_direct_vs_reference", "peak_vram_mb"]),
         "generate_fast_path": compact(generate_fast_path, ["_lineno", "fast_token_backend", "fast_token_backend_effective", "batch_size", "reference_generate", "hf_generate_fast", "speedup_vs_reference", "generated_equal", "generated_tokens_matched", "generated_tokens_total", "prompt_tokens", "max_new_tokens", "peak_vram_mb"]),
@@ -2774,6 +2803,12 @@ def print_text(report: dict[str, Any]) -> None:
     print("\n## cuda_state_scan_micro")
     if report["cuda_state_scan_micro"]:
         for row in report["cuda_state_scan_micro"]:
+            print(json.dumps(row, ensure_ascii=False))
+    else:
+        print("PENDING")
+    print("\n## triton_state_scan_micro")
+    if report["triton_state_scan_micro"]:
+        for row in report["triton_state_scan_micro"]:
             print(json.dumps(row, ensure_ascii=False))
     else:
         print("PENDING")
