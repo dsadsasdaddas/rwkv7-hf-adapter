@@ -467,6 +467,41 @@ def _native_prefill_fused_state_scan_enabled() -> bool:
         return False
 
 
+def _native_prefill_scan_precompute_w_enabled() -> bool:
+    """Opt-in precompute of W decay before the fused state-scan kernel.
+
+    The default fused state-scan computes ``exp(-0.606531 * sigmoid(w_raw))``
+    inside the dominant recurrent scan loop.  This experiment materializes the
+    decay once before the scan and lets the scan load it directly.  It is kept
+    behind an env flag because it trades extra pointwise launches and memory
+    traffic for lower special-function pressure inside the scan kernel.
+    """
+
+    return env_flag("RWKV7_NATIVE_PREFILL_SCAN_PRECOMPUTE_W", False)
+
+
+def _native_prefill_scan_precompute_w_dtype() -> str:
+    """Dtype for opt-in precomputed W decay passed to fused state-scan."""
+
+    raw = os.environ.get("RWKV7_NATIVE_PREFILL_SCAN_PRECOMPUTE_W_DTYPE", "fp32").strip().lower()
+    aliases = {
+        "fp32": "fp32",
+        "float32": "fp32",
+        "f32": "fp32",
+        "input": "input",
+        "model": "input",
+        "same": "input",
+        "fp16": "input",
+        "bf16": "input",
+    }
+    if raw not in aliases:
+        raise ValueError(
+            "RWKV7_NATIVE_PREFILL_SCAN_PRECOMPUTE_W_DTYPE must be 'fp32' or 'input' "
+            f"(aliases: same/model/fp16/bf16); got {raw!r}"
+        )
+    return aliases[raw]
+
+
 def _native_prefill_fused_state_scan_correction_enabled() -> bool:
     """Runtime switch for state-scan that emits correction instead of K/V."""
 
@@ -1654,6 +1689,13 @@ def prefill(
                 _native_prefill_cuda_state_scan_rows_per_block() if use_cuda_state_scan else 1
             )
             cuda_state_scan_schedule = _native_prefill_cuda_state_scan_schedule() if use_cuda_state_scan else "default"
+            state_scan_precompute_w = _native_prefill_scan_precompute_w_enabled() and not use_cuda_state_scan
+            state_scan_precompute_w_dtype = _native_prefill_scan_precompute_w_dtype()
+            w_for_state_scan = w
+            if state_scan_precompute_w:
+                w_for_state_scan = torch.sigmoid(w.float()).mul_(-0.606531).exp_()
+                if state_scan_precompute_w_dtype == "input":
+                    w_for_state_scan = w_for_state_scan.to(dtype=w.dtype)
             if use_cuda_state_scan and layer_idx == 0:
                 out, new_state, k, v = cuda_state_scan_prep(
                     r.view(B, T, H, N),
@@ -1692,7 +1734,7 @@ def prefill(
             elif layer_idx == 0:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(
                     r.view(B, T, H, N),
-                    w.view(B, T, H, N),
+                    w_for_state_scan.view(B, T, H, N),
                     k.view(B, T, H, N),
                     v.view(B, T, H, N),
                     a.view(B, T, H, N),
@@ -1705,12 +1747,13 @@ def prefill(
                     num_stages=state_scan_num_stages,
                     algebraic_output=state_scan_algebraic_output,
                     nomask64=state_scan_nomask64,
+                    precomputed_w=state_scan_precompute_w,
                 )
                 v_first_seq = v.reshape(B, T, hidden)
             else:
                 out, new_state, k, v = fused_recurrent_scan_state_prep(
                     r.view(B, T, H, N),
-                    w.view(B, T, H, N),
+                    w_for_state_scan.view(B, T, H, N),
                     k.view(B, T, H, N),
                     v.view(B, T, H, N),
                     a.view(B, T, H, N),
@@ -1725,6 +1768,7 @@ def prefill(
                     num_stages=state_scan_num_stages,
                     algebraic_output=state_scan_algebraic_output,
                     nomask64=state_scan_nomask64,
+                    precomputed_w=state_scan_precompute_w,
                 )
             out = out.reshape(B, T, hidden)
             k = k.reshape(B, T, hidden)

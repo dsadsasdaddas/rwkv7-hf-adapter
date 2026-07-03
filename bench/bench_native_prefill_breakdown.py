@@ -90,6 +90,14 @@ def scan_nomask64() -> bool:
     return getattr(native_jit, "_native_prefill_scan_nomask64_enabled", lambda: False)()
 
 
+def scan_precompute_w() -> bool:
+    return getattr(native_jit, "_native_prefill_scan_precompute_w_enabled", lambda: False)()
+
+
+def scan_precompute_w_dtype() -> str:
+    return getattr(native_jit, "_native_prefill_scan_precompute_w_dtype", lambda: "fp32")()
+
+
 def median(vals: list[float]) -> float:
     vals = sorted(vals)
     return vals[len(vals) // 2]
@@ -579,6 +587,22 @@ def profiled_native_prefill(
             cuda_state_scan_schedule = (
                 native_jit._native_prefill_cuda_state_scan_schedule() if use_cuda_state_scan else "default"
             )
+            state_scan_precompute_w = (
+                getattr(native_jit, "_native_prefill_scan_precompute_w_enabled", lambda: False)()
+                and not use_cuda_state_scan
+            )
+            state_scan_precompute_w_dtype = getattr(
+                native_jit, "_native_prefill_scan_precompute_w_dtype", lambda: "fp32"
+            )()
+            w_for_state_scan = w
+            if state_scan_precompute_w:
+                def precompute_w_decay():
+                    w_decay = torch.sigmoid(w.float()).mul_(-0.606531).exp_()
+                    if state_scan_precompute_w_dtype == "input":
+                        w_decay = w_decay.to(dtype=w.dtype)
+                    return w_decay
+
+                w_for_state_scan = profiler.measure("attn_w_decay_precompute", precompute_w_decay)
 
             def state_scan():
                 if use_cuda_state_scan and layer_idx == 0:
@@ -618,7 +642,7 @@ def profiled_native_prefill(
                 if layer_idx == 0:
                     return native_jit.fused_recurrent_scan_state_prep(
                         r.view(B, T, H, N),
-                        w.view(B, T, H, N),
+                        w_for_state_scan.view(B, T, H, N),
                         k.view(B, T, H, N),
                         v.view(B, T, H, N),
                         a.view(B, T, H, N),
@@ -631,10 +655,11 @@ def profiled_native_prefill(
                         num_stages=state_scan_num_stages,
                         algebraic_output=state_scan_algebraic_output,
                         nomask64=state_scan_nomask64,
+                        precomputed_w=state_scan_precompute_w,
                     )
                 return native_jit.fused_recurrent_scan_state_prep(
                     r.view(B, T, H, N),
-                    w.view(B, T, H, N),
+                    w_for_state_scan.view(B, T, H, N),
                     k.view(B, T, H, N),
                     v.view(B, T, H, N),
                     a.view(B, T, H, N),
@@ -649,6 +674,7 @@ def profiled_native_prefill(
                     num_stages=state_scan_num_stages,
                     algebraic_output=state_scan_algebraic_output,
                     nomask64=state_scan_nomask64,
+                    precomputed_w=state_scan_precompute_w,
                 )
 
             component_name = "recurrent_scan_state_prep_cuda" if use_cuda_state_scan else "recurrent_scan_state_prep_fused"
@@ -946,6 +972,8 @@ def run_case(args: argparse.Namespace, tok, model, batch_size: int, prompt_token
         "scan_num_stages": scan_num_stages(),
         "scan_algebraic_output": scan_algebraic_output(),
         "scan_nomask64": scan_nomask64(),
+        "scan_precompute_w": scan_precompute_w(),
+        "scan_precompute_w_dtype": scan_precompute_w_dtype(),
         "prefill_cuda_state_scan_requested": os.environ.get("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN", "0").lower() not in {"0", "false", "no", "off"},
         "prefill_cuda_state_scan_effective": getattr(native_jit, "_native_prefill_cuda_state_scan_enabled", lambda: False)(),
         "prefill_cuda_state_scan_lanes": getattr(native_jit, "_native_prefill_cuda_state_scan_lanes_per_row", lambda: 1)(),

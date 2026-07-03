@@ -306,6 +306,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             r.get("scan_num_stages"),
             bool(r.get("scan_algebraic_output")),
             bool(r.get("scan_nomask64")),
+            bool(r.get("scan_precompute_w")),
+            r.get("scan_precompute_w_dtype"),
             bool(r.get("prefill_cuda_state_scan_effective")),
             bool(r.get("fine_attention_breakdown")),
             bool(r.get("layer_breakdown")),
@@ -338,6 +340,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
             r.get("scan_num_stages"),
             bool(r.get("scan_algebraic_output")),
             bool(r.get("scan_nomask64")),
+            bool(r.get("scan_precompute_w")),
+            r.get("scan_precompute_w_dtype"),
             bool(r.get("prefill_cuda_state_scan_effective")),
             bool(r.get("fine_attention_breakdown")),
             bool(r.get("prefill_fused_scan_output_effective")),
@@ -1251,6 +1255,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     r.get("scan_num_stages"),
                     bool(r.get("scan_algebraic_output")),
                     bool(r.get("scan_nomask64")),
+                    bool(r.get("scan_precompute_w")),
+                    r.get("scan_precompute_w_dtype"),
                     bool(r.get("prefill_cuda_state_scan_effective")),
                     bool(r.get("prefill_fused_scan_output_effective")),
                     bool(r.get("prefill_fused_clampw_scan_effective")),
@@ -1285,6 +1291,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     and r.get("prompt_tokens") == row.get("prompt_tokens")
                     and bool(r.get("scan_algebraic_output")) == bool(row.get("scan_algebraic_output"))
                     and bool(r.get("scan_nomask64")) == bool(row.get("scan_nomask64"))
+                    and bool(r.get("scan_precompute_w")) == bool(row.get("scan_precompute_w"))
+                    and r.get("scan_precompute_w_dtype") == row.get("scan_precompute_w_dtype")
                     and bool(r.get("prefill_cuda_state_scan_effective")) == bool(row.get("prefill_cuda_state_scan_effective"))
                     and bool(r.get("prefill_fused_state_prep_effective")) == bool(row.get("prefill_fused_state_prep_effective"))
                     and not bool(r.get("prefill_fused_clampw_scan_effective"))
@@ -1315,6 +1323,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     and r.get("scan_num_stages") == row.get("scan_num_stages")
                     and bool(r.get("scan_algebraic_output")) == bool(row.get("scan_algebraic_output"))
                     and bool(r.get("scan_nomask64")) == bool(row.get("scan_nomask64"))
+                    and bool(r.get("scan_precompute_w")) == bool(row.get("scan_precompute_w"))
+                    and r.get("scan_precompute_w_dtype") == row.get("scan_precompute_w_dtype")
                     and bool(r.get("prefill_cuda_state_scan_effective")) == bool(row.get("prefill_cuda_state_scan_effective"))
                     and bool(r.get("prefill_fused_state_prep_effective")) == bool(row.get("prefill_fused_state_prep_effective"))
                     and bool(r.get("prefill_fused_shift_mix_effective")) == bool(row.get("prefill_fused_shift_mix_effective"))
@@ -1361,6 +1371,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     and r.get("scan_num_stages") == row.get("scan_num_stages")
                     and bool(r.get("scan_algebraic_output")) == bool(row.get("scan_algebraic_output"))
                     and bool(r.get("scan_nomask64")) == bool(row.get("scan_nomask64"))
+                    and bool(r.get("scan_precompute_w")) == bool(row.get("scan_precompute_w"))
+                    and r.get("scan_precompute_w_dtype") == row.get("scan_precompute_w_dtype")
                     and bool(r.get("prefill_cuda_state_scan_effective")) == bool(row.get("prefill_cuda_state_scan_effective"))
                     and bool(r.get("prefill_fused_state_prep_effective")) == bool(row.get("prefill_fused_state_prep_effective"))
                     and bool(r.get("prefill_fused_clampw_scan_effective")) == bool(row.get("prefill_fused_clampw_scan_effective"))
@@ -1391,6 +1403,8 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
                     and r.get("scan_num_stages") == row.get("scan_num_stages")
                     and bool(r.get("scan_algebraic_output")) == bool(row.get("scan_algebraic_output"))
                     and bool(r.get("scan_nomask64")) == bool(row.get("scan_nomask64"))
+                    and bool(r.get("scan_precompute_w")) == bool(row.get("scan_precompute_w"))
+                    and r.get("scan_precompute_w_dtype") == row.get("scan_precompute_w_dtype")
                     and bool(r.get("prefill_cuda_state_scan_effective")) == bool(row.get("prefill_cuda_state_scan_effective"))
                     and bool(r.get("prefill_fused_scan_output_effective")) == bool(row.get("prefill_fused_scan_output_effective"))
                     and bool(r.get("prefill_fused_clampw_scan_effective")) == bool(row.get("prefill_fused_clampw_scan_effective"))
@@ -2311,11 +2325,11 @@ def analyze(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, A
         ],
         "chunked_prefill": [compact(r, ["_lineno", "prefill_mode", "batch_size", "prompt_tokens", "chunk_size", "prefill_tokps_total", "speed_ratio_vs_full", "peak_vram_mb", "peak_vram_ratio_vs_full", "max_abs_diff", "decode_max_abs_diff", "seq_length_match"]) for r in chunked_latest],
         "native_prefill_scan": [
-            compact(r, ["_lineno", "status", "dtype", "device", "code_source", "native_jit_module", "effective_model_path", "batch_size", "prompt_tokens", "tokens_total", "fused_scan_requested", "scan_block_m", "scan_num_warps", "scan_num_stages", "scan_algebraic_output", "scan_nomask64", "prefill_cuda_state_scan_requested", "prefill_cuda_state_scan_effective", "prefill_cuda_state_scan_lanes", "prefill_cuda_state_scan_precompute", "prefill_cuda_state_scan_precompute_mode", "prefill_cuda_state_scan_rows_per_block", "prefill_cuda_state_scan_schedule", "prefill_fused_scan_output_requested", "prefill_fused_scan_output_effective", "prefill_fused_clampw_scan_requested", "prefill_fused_clampw_scan_effective", "prefill_dplr_scan_requested", "prefill_dplr_scan_effective", "prefill_dplr_algorithm", "prefill_dplr_chunk_size", "prefill_dplr_compact_block_n", "prefill_dplr_compact_block_r", "prefill_dplr_compact_prefix_block_m", "prefill_dplr_compact_start_state_dtype", "prefill_dplr_compact_output_only", "prefill_dplr_compact_recompute_starts", "prefill_dplr_compact_prefix_shared", "prefill_dplr_compact_prefix_shared_group_size", "prefill_fused_shift_mix_requested", "prefill_fused_shift_mix_effective", "prefill_fused_state_prep_requested", "prefill_fused_state_prep_effective", "prefill_fused_state_scan_requested", "prefill_fused_state_scan_effective", "prefill_fused_state_scan_correction_requested", "prefill_fused_state_scan_correction_effective", "prefill_fused_state_scan_raw_output_requested", "prefill_fused_state_scan_raw_output_effective", "prefill_fused_output_requested", "prefill_fused_output_effective", "prefill_fused_wavg_lora_requested", "prefill_fused_wavg_lora_effective", "prefill_fused_wavg_lora_max_m", "prefill_fused_projection_requested", "prefill_fused_projection_effective", "prefill_fused_projection_max_m", "prefill_fused_projection_block_m", "prefill_fused_projection_block_r", "prefill_fused_projection_block_k", "fast_token_backend_after_native_prefill", "hf_prefill_ms", "native_prefill_ms", "native_vs_hf_speedup", "hf_prefill_tokps_total", "native_prefill_tokps_total", "max_abs_diff", "min_cosine", "greedy_match", "decode_after_prefill_max_abs_diff", "decode_after_prefill_greedy_match", "peak_vram_mb"])
+            compact(r, ["_lineno", "status", "dtype", "device", "code_source", "native_jit_module", "effective_model_path", "batch_size", "prompt_tokens", "tokens_total", "fused_scan_requested", "scan_block_m", "scan_num_warps", "scan_num_stages", "scan_algebraic_output", "scan_nomask64", "scan_precompute_w", "scan_precompute_w_dtype", "prefill_cuda_state_scan_requested", "prefill_cuda_state_scan_effective", "prefill_cuda_state_scan_lanes", "prefill_cuda_state_scan_precompute", "prefill_cuda_state_scan_precompute_mode", "prefill_cuda_state_scan_rows_per_block", "prefill_cuda_state_scan_schedule", "prefill_fused_scan_output_requested", "prefill_fused_scan_output_effective", "prefill_fused_clampw_scan_requested", "prefill_fused_clampw_scan_effective", "prefill_dplr_scan_requested", "prefill_dplr_scan_effective", "prefill_dplr_algorithm", "prefill_dplr_chunk_size", "prefill_dplr_compact_block_n", "prefill_dplr_compact_block_r", "prefill_dplr_compact_prefix_block_m", "prefill_dplr_compact_start_state_dtype", "prefill_dplr_compact_output_only", "prefill_dplr_compact_recompute_starts", "prefill_dplr_compact_prefix_shared", "prefill_dplr_compact_prefix_shared_group_size", "prefill_fused_shift_mix_requested", "prefill_fused_shift_mix_effective", "prefill_fused_state_prep_requested", "prefill_fused_state_prep_effective", "prefill_fused_state_scan_requested", "prefill_fused_state_scan_effective", "prefill_fused_state_scan_correction_requested", "prefill_fused_state_scan_correction_effective", "prefill_fused_state_scan_raw_output_requested", "prefill_fused_state_scan_raw_output_effective", "prefill_fused_output_requested", "prefill_fused_output_effective", "prefill_fused_wavg_lora_requested", "prefill_fused_wavg_lora_effective", "prefill_fused_wavg_lora_max_m", "prefill_fused_projection_requested", "prefill_fused_projection_effective", "prefill_fused_projection_max_m", "prefill_fused_projection_block_m", "prefill_fused_projection_block_r", "prefill_fused_projection_block_k", "fast_token_backend_after_native_prefill", "hf_prefill_ms", "native_prefill_ms", "native_vs_hf_speedup", "hf_prefill_tokps_total", "native_prefill_tokps_total", "max_abs_diff", "min_cosine", "greedy_match", "decode_after_prefill_max_abs_diff", "decode_after_prefill_greedy_match", "peak_vram_mb"])
             for r in native_prefill_scan
         ],
         "native_prefill_breakdown": [
-            compact(r, ["_lineno", "status", "dtype", "device", "model_size_label", "batch_size", "prompt_tokens", "tokens_total", "fused_scan_requested", "scan_block_m", "scan_num_warps", "scan_num_stages", "scan_algebraic_output", "scan_nomask64", "prefill_cuda_state_scan_requested", "prefill_cuda_state_scan_effective", "prefill_cuda_state_scan_lanes", "prefill_cuda_state_scan_precompute", "prefill_cuda_state_scan_precompute_mode", "prefill_cuda_state_scan_rows_per_block", "prefill_cuda_state_scan_schedule", "fine_attention_breakdown", "layer_breakdown", "prefill_fused_scan_output_requested", "prefill_fused_scan_output_effective", "prefill_fused_clampw_scan_requested", "prefill_fused_clampw_scan_effective", "prefill_dplr_scan_requested", "prefill_dplr_scan_effective", "prefill_dplr_algorithm", "prefill_dplr_chunk_size", "prefill_dplr_compact_block_n", "prefill_dplr_compact_block_r", "prefill_dplr_compact_prefix_block_m", "prefill_dplr_compact_start_state_dtype", "prefill_dplr_compact_output_only", "prefill_dplr_compact_recompute_starts", "prefill_dplr_compact_prefix_shared", "prefill_dplr_compact_prefix_shared_group_size", "prefill_fused_shift_mix_requested", "prefill_fused_shift_mix_effective", "prefill_fused_state_prep_requested", "prefill_fused_state_prep_effective", "prefill_fused_state_scan_requested", "prefill_fused_state_scan_effective", "prefill_fused_state_scan_correction_requested", "prefill_fused_state_scan_correction_effective", "prefill_fused_state_scan_raw_output_requested", "prefill_fused_state_scan_raw_output_effective", "prefill_fused_output_requested", "prefill_fused_output_effective", "prefill_fused_wavg_lora_requested", "prefill_fused_wavg_lora_effective", "prefill_fused_wavg_lora_max_m", "prefill_fused_projection_requested", "prefill_fused_projection_effective", "prefill_fused_projection_max_m", "profiled_total_gpu_ms", "component_sum_ms", "profiled_tokps_total", "component_ms", "component_share", "top_components", "layer_total_ms", "top_layers_by_total", "layer_top_components", "max_abs_diff_vs_native_prefill", "greedy_match_vs_native_prefill", "peak_vram_mb"])
+            compact(r, ["_lineno", "status", "dtype", "device", "model_size_label", "batch_size", "prompt_tokens", "tokens_total", "fused_scan_requested", "scan_block_m", "scan_num_warps", "scan_num_stages", "scan_algebraic_output", "scan_nomask64", "scan_precompute_w", "scan_precompute_w_dtype", "prefill_cuda_state_scan_requested", "prefill_cuda_state_scan_effective", "prefill_cuda_state_scan_lanes", "prefill_cuda_state_scan_precompute", "prefill_cuda_state_scan_precompute_mode", "prefill_cuda_state_scan_rows_per_block", "prefill_cuda_state_scan_schedule", "fine_attention_breakdown", "layer_breakdown", "prefill_fused_scan_output_requested", "prefill_fused_scan_output_effective", "prefill_fused_clampw_scan_requested", "prefill_fused_clampw_scan_effective", "prefill_dplr_scan_requested", "prefill_dplr_scan_effective", "prefill_dplr_algorithm", "prefill_dplr_chunk_size", "prefill_dplr_compact_block_n", "prefill_dplr_compact_block_r", "prefill_dplr_compact_prefix_block_m", "prefill_dplr_compact_start_state_dtype", "prefill_dplr_compact_output_only", "prefill_dplr_compact_recompute_starts", "prefill_dplr_compact_prefix_shared", "prefill_dplr_compact_prefix_shared_group_size", "prefill_fused_shift_mix_requested", "prefill_fused_shift_mix_effective", "prefill_fused_state_prep_requested", "prefill_fused_state_prep_effective", "prefill_fused_state_scan_requested", "prefill_fused_state_scan_effective", "prefill_fused_state_scan_correction_requested", "prefill_fused_state_scan_correction_effective", "prefill_fused_state_scan_raw_output_requested", "prefill_fused_state_scan_raw_output_effective", "prefill_fused_output_requested", "prefill_fused_output_effective", "prefill_fused_wavg_lora_requested", "prefill_fused_wavg_lora_effective", "prefill_fused_wavg_lora_max_m", "prefill_fused_projection_requested", "prefill_fused_projection_effective", "prefill_fused_projection_max_m", "profiled_total_gpu_ms", "component_sum_ms", "profiled_tokps_total", "component_ms", "component_share", "top_components", "layer_total_ms", "top_layers_by_total", "layer_top_components", "max_abs_diff_vs_native_prefill", "greedy_match_vs_native_prefill", "peak_vram_mb"])
             for r in native_prefill_breakdown
         ],
         "cuda_state_scan_micro": [

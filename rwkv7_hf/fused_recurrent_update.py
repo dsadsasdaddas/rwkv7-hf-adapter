@@ -225,6 +225,7 @@ if _HAS_TRITON:
         H: tl.constexpr,
         N: tl.constexpr,
         HAS_V_GATE: tl.constexpr,
+        W_PRECOMPUTED: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
         bh_id = tl.program_id(0)
@@ -261,7 +262,10 @@ if _HAS_TRITON:
                 vf = tl.load(v_first_ptr + vec_base + offs, mask=mask, other=0.0).to(tl.float32)
                 vg = tl.load(v_gate_ptr + vec_base + offs, mask=mask, other=0.0).to(tl.float32)
                 v_adj = v_raw + (vf - v_raw) * vg
-            w = tl.exp(-0.606531 * tl.sigmoid(w_raw))
+            if W_PRECOMPUTED:
+                w = w_raw
+            else:
+                w = tl.exp(-0.606531 * tl.sigmoid(w_raw))
 
             state_dot_kk = tl.sum(st * kk[None, :], axis=1)
             st = st * w[None, :] + v_adj[:, None] * k_adj[None, :] - state_dot_kk[:, None] * kk[None, :] * a_val[None, :]
@@ -583,6 +587,7 @@ if _HAS_TRITON:
         N: tl.constexpr,
         ROW_BLOCKS: tl.constexpr,
         HAS_V_GATE: tl.constexpr,
+        W_PRECOMPUTED: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -628,7 +633,10 @@ if _HAS_TRITON:
                 vf_i = tl.load(v_first_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
                 vg_i = tl.load(v_gate_ptr + vec_base + offs_i, mask=mask_i, other=0.0).to(tl.float32)
                 v_adj_i = v_raw_i + (vf_i - v_raw_i) * vg_i
-            w = tl.exp(-0.606531 * tl.sigmoid(w_raw))
+            if W_PRECOMPUTED:
+                w = w_raw
+            else:
+                w = tl.exp(-0.606531 * tl.sigmoid(w_raw))
 
             state_dot_kk = tl.sum(st * kk[None, :], axis=1)
             st = st * w[None, :] + v_adj_i[:, None] * k_adj_j[None, :] - state_dot_kk[:, None] * kk[None, :] * a_j[None, :]
@@ -1719,6 +1727,7 @@ def fused_recurrent_scan_state_prep(
     num_stages: int = 3,
     algebraic_output: bool = False,
     nomask64: bool = False,
+    precomputed_w: bool = False,
     force_fallback: bool = False,
 ):
     """Fuse native-prefill state prep with the recurrent scan.
@@ -1784,7 +1793,8 @@ def fused_recurrent_scan_state_prep(
         and (not has_v_gate or (vf4.is_cuda and vg4.is_cuda))
         and state.dtype == torch.float32
         and r4.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and all(t.dtype == r4.dtype for t in (w4, k4, v4, a4))
+        and ((precomputed_w and w4.dtype in (r4.dtype, torch.float32)) or (not precomputed_w and w4.dtype == r4.dtype))
+        and all(t.dtype == r4.dtype for t in (k4, v4, a4))
         and k_k.dtype == r4.dtype
         and k_a.dtype == r4.dtype
         and (not has_v_gate or (vf4.dtype == r4.dtype and vg4.dtype == r4.dtype))
@@ -1796,7 +1806,7 @@ def fused_recurrent_scan_state_prep(
             v_adj = v4 + (vf4 - v4) * vg4
         else:
             v_adj = v4
-        w_decay = torch.exp(-0.606531 * torch.sigmoid(w4.float()))
+        w_decay = w4.float() if precomputed_w else torch.exp(-0.606531 * torch.sigmoid(w4.float()))
         out, final_state = torch_recurrent_scan(r4.reshape(B, int(r4.shape[1]), H * N) if flat else r4, w_decay, k_adj, v_adj, kk, a4, state)
         if flat:
             return out, final_state, k_adj.reshape(B, int(k4.shape[1]), H * N), v_adj.reshape(B, int(v4.shape[1]), H * N)
@@ -1839,12 +1849,13 @@ def fused_recurrent_scan_state_prep(
             N,
             ROW_BLOCKS=int(row_blocks),
             HAS_V_GATE=bool(has_v_gate),
+            W_PRECOMPUTED=bool(precomputed_w),
             BLOCK_M=int(block_m),
             BLOCK_N=int(block_n),
             num_warps=int(num_warps),
             num_stages=num_stages,
         )
-    elif nomask64 and N == 64 and int(block_n) == 64:
+    elif nomask64 and not precomputed_w and N == 64 and int(block_n) == 64:
         _recurrent_scan_state_prep_nomask64_kernel[(B * H,)](
             r_c,
             w_c,
@@ -1868,7 +1879,7 @@ def fused_recurrent_scan_state_prep(
             num_warps=int(num_warps),
             num_stages=num_stages,
         )
-    elif algebraic_output:
+    elif algebraic_output and not precomputed_w:
         _recurrent_scan_state_prep_algebraic_out_kernel[(B * H,)](
             r_c,
             w_c,
@@ -1912,6 +1923,7 @@ def fused_recurrent_scan_state_prep(
             H,
             N,
             HAS_V_GATE=bool(has_v_gate),
+            W_PRECOMPUTED=bool(precomputed_w),
             BLOCK_N=int(block_n),
             num_warps=int(num_warps),
             num_stages=num_stages,

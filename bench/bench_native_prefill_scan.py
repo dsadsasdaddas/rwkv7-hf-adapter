@@ -221,6 +221,8 @@ def run_case(args: argparse.Namespace, tok, model, batch_size: int, prompt_token
         "scan_num_stages": scan_num_stages(model),
         "scan_algebraic_output": getattr(nj, "_native_prefill_scan_algebraic_output_enabled", lambda: False)(),
         "scan_nomask64": getattr(nj, "_native_prefill_scan_nomask64_enabled", lambda: False)(),
+        "scan_precompute_w": getattr(nj, "_native_prefill_scan_precompute_w_enabled", lambda: False)(),
+        "scan_precompute_w_dtype": getattr(nj, "_native_prefill_scan_precompute_w_dtype", lambda: "fp32")(),
         "prefill_cuda_state_scan_requested": os.environ.get("RWKV7_NATIVE_PREFILL_CUDA_STATE_SCAN", "0").lower() not in {"0", "false", "no", "off"},
         "prefill_cuda_state_scan_effective": getattr(nj, "_native_prefill_cuda_state_scan_enabled", lambda: False)(),
         "prefill_cuda_state_scan_lanes": getattr(nj, "_native_prefill_cuda_state_scan_lanes_per_row", lambda: 1)(),

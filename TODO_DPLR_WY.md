@@ -909,7 +909,7 @@ Branch: `wangyue/native-prefill-060-albatross`
     serial prefix sharing. Compact-WY is now frozen as an opt-in
     research/quantization track for this branch. The next `0.60x` Albatross
     work moves back to the main fused fp16 recurrent-scan/output path.
-- [ ] Next main fused-fp16 task:
+- [x] Next main fused-fp16 task:
   - Resume the main Albatross-gap line instead of compact-WY. Start from the
     strict confirmed 4090 row `27,051.0 tok/s` and profile/reduce the largest
     remaining native prefill costs in the fused state-scan + fused-output path.
@@ -917,6 +917,68 @@ Branch: `wangyue/native-prefill-060-albatross`
     on the main path and must compare against the same-run fused recurrent
     scan baseline. Promotion gate: move toward `>=31,289 tok/s` without
     breaking greedy/cache/decode smoke.
+  - Done: refreshed the corrected 4090 mainline profile and tried two bounded
+    main-path experiments.
+    - refreshed baseline/result files:
+      - `bench/results_native_4090_main_baseline_20260703_000836.jsonl`
+        from remote `/tmp/native_4090_main_baseline_20260703_000836.jsonl`;
+      - `bench/results_native_4090_main_breakdown_20260703_000836.jsonl`
+        from remote `/tmp/native_4090_main_breakdown_20260703_000836.jsonl`.
+    - refreshed 4090 / 0.4B / prompt512 / bsz1 baseline:
+      - e2e row: pass, `25,891.5 tok/s`, `19.7748 ms`, peak
+        `989.2 MiB`;
+      - breakdown row: `recurrent_scan_state_prep_fused` remains dominant:
+        `13.4225 ms`, `51.66%`; next are FFN `2.2284 ms`, W/A/V/G LoRA
+        about `6.37 ms` combined, and norm/shift-mix `1.2908 ms`.
+    - Experiment A: opt-in W-decay precompute before fused state-scan:
+      - added `RWKV7_NATIVE_PREFILL_SCAN_PRECOMPUTE_W=1` and
+        `RWKV7_NATIVE_PREFILL_SCAN_PRECOMPUTE_W_DTYPE={fp32,input}`.
+      - implementation keeps default behavior unchanged; when enabled,
+        native prefill materializes `exp(-0.606531 * sigmoid(w_raw))` before
+        calling `fused_recurrent_scan_state_prep(...)`, and the Triton scan
+        kernel skips its internal sigmoid/exp via `W_PRECOMPUTED`.
+      - telemetry/analyzer now record `scan_precompute_w` and
+        `scan_precompute_w_dtype`; profiler records
+        `attn_w_decay_precompute`.
+      - smoke result file:
+        `bench/results_native_4090_prew_smoke_20260703_002028.jsonl`;
+        breakdown result file:
+        `bench/results_native_4090_prew_breakdown_20260703_002205.jsonl`.
+      - smoke rows all pass greedy/cache/decode:
+        - same-run baseline: `25,477.1 tok/s`, `20.0965 ms`;
+        - precompute W fp32: `24,089.8 tok/s`, `21.2538 ms`;
+        - precompute W input/fp16: `24,248.3 tok/s`, `21.1149 ms`,
+          max diff `0.125`.
+      - breakdown explains the loss: state-scan time does not improve
+        (`13.2082 ms` baseline vs `13.2148 ms` precompute-W), while the new
+        `attn_w_decay_precompute` component adds `1.6128 ms`.
+      - conclusion: do not promote W precompute. The bottleneck is not the
+        scan-loop W sigmoid/exp boundary.
+    - Experiment B: tune the existing opt-in fused WAVG-LoRA prefill kernel
+      after the refreshed profile showed LoRA as the next largest aggregate
+      cost outside state-scan.
+      - single-process sweep result file:
+        `bench/results_native_4090_wavg_lora_blocks_single_20260703_002450.jsonl`;
+      - confirmation result file:
+        `bench/results_native_4090_wavg_lora_best_confirm_20260703_002557.jsonl`.
+      - best sweep setting was `block_m=64,block_r=32,block_k=64`: pass,
+        `24,842.6 tok/s` vs same-run baseline `24,630.8 tok/s`.
+      - confirmation stayed correctness-clean but the gain was small/noisy:
+        - pass 1: baseline `24,893.6 tok/s`, tuned WAVG `25,206.7 tok/s`;
+        - pass 2: baseline `25,464.2 tok/s`, tuned WAVG `25,539.5 tok/s`.
+      - conclusion: keep fused WAVG-LoRA opt-in and tuned setting recorded,
+        but do not promote it as a default because it does not approach the
+        strict best mainline row (`27,051.0 tok/s`) or the `0.60x` target.
+- [ ] Next main fused-fp16 task:
+  - Stop spending iterations on W precompute or shallow WAVG-LoRA tuning.
+    The next `0.60x` attempt should target the actual remaining scan
+    state-layout/readout work: either a stronger full-head state-scan phase
+    probe that isolates state-dot/update/readout costs in the Triton path, or
+    a CUDA/persistent row-register schedule that improves on the previous
+    row-block near-parity result without adding global temp precompute.
+  - Same-run gate remains: compare against fused recurrent scan + fused output
+    baseline on 4090 / 0.4B / prompt512 / bsz1, preserve greedy/cache/decode
+    smoke, and only promote if it moves toward `>=31,289 tok/s`.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of
