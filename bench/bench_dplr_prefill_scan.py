@@ -565,6 +565,7 @@ def emit_compact_stage_probe(
     dplr_compact_wy_chunk_summary_triton: Callable[..., Any] | None,
     dplr_compact_wy_prefix_combine_torch: Callable[..., Any] | None,
     dplr_compact_wy_prefix_combine_triton: Callable[..., Any] | None,
+    dplr_compact_wy_grouped_prefix_shared_apply_output_triton: Callable[..., Any] | None,
     dplr_compact_wy_prefix_shared_apply_output_triton: Callable[..., Any] | None,
     dplr_compact_wy_recompute_phase_probe_triton: Callable[..., Any] | None,
     dplr_compact_wy_recompute_apply_output_triton: Callable[..., Any] | None,
@@ -581,6 +582,8 @@ def emit_compact_stage_probe(
     materializing dense chunk-end states in stage 3.
     """
 
+    grouped_prefix_shared_sizes = tuple(g for g in (1, 2, 4) if (T // int(chunk_size)) % g == 0 and g < (T // int(chunk_size)))
+    grouped_prefix_shared_stages = tuple(f"compact_grouped_prefix_shared_g{g}" for g in grouped_prefix_shared_sizes)
     stages = (
         "compact_chunk_summary",
         "compact_prefix_combine",
@@ -593,6 +596,7 @@ def emit_compact_stage_probe(
         "compact_recompute_token_apply_only_probe",
         "compact_prefix_shared_apply_output",
         "compact3_prefix_shared_full",
+        *grouped_prefix_shared_stages,
     )
     required = (
         dplr_compact_wy_apply_summaries_torch,
@@ -600,6 +604,7 @@ def emit_compact_stage_probe(
         dplr_compact_wy_chunk_summary_triton,
         dplr_compact_wy_prefix_combine_torch,
         dplr_compact_wy_prefix_combine_triton,
+        dplr_compact_wy_grouped_prefix_shared_apply_output_triton,
         dplr_compact_wy_prefix_shared_apply_output_triton,
         dplr_compact_wy_recompute_phase_probe_triton,
         dplr_compact_wy_recompute_apply_output_triton,
@@ -610,7 +615,7 @@ def emit_compact_stage_probe(
     )
     rows = 0
 
-    def make_stage_row(stage: str) -> dict[str, Any]:
+    def make_stage_row(stage: str, *, group_size: int | None = None) -> dict[str, Any]:
         row = base_row(args, B=B, T=T, H=H, N=N)
         row["axis"] = "dplr_compact_wy_stage_proto"
         row.update(
@@ -647,7 +652,9 @@ def emit_compact_stage_probe(
                 in {
                     "compact_prefix_shared_apply_output",
                     "compact3_prefix_shared_full",
-                },
+                }
+                or stage.startswith("compact_grouped_prefix_shared_g"),
+                "compact_prefix_shared_group_size": group_size,
             }
         )
         return row
@@ -758,6 +765,20 @@ def emit_compact_stage_probe(
                 chunk_size=int(chunk_size),
                 prefix_shared=True,
             )
+            grouped_prefix_shared_got: dict[int, tuple[Any, Any]] = {}
+            for group_size in grouped_prefix_shared_sizes:
+                grouped_prefix_shared_got[int(group_size)] = dplr_compact_wy_grouped_prefix_shared_apply_output_triton(  # type: ignore[misc]
+                    xs["r"],
+                    xs["w"],
+                    xs["k"],
+                    xs["v"],
+                    xs["kk"],
+                    xs["a"],
+                    xs["state"],
+                    summary_got,
+                    chunk_size=int(chunk_size),
+                    group_size=int(group_size),
+                )
 
         summary_ms = timed(
             lambda: dplr_compact_wy_chunk_summary_triton(  # type: ignore[misc]
@@ -869,6 +890,25 @@ def emit_compact_stage_probe(
             warmup=args.warmup,
             steps=args.steps,
         )
+        grouped_prefix_shared_ms: dict[int, float] = {}
+        for group_size in grouped_prefix_shared_sizes:
+            grouped_prefix_shared_ms[int(group_size)] = timed(
+                lambda group_size=int(group_size): dplr_compact_wy_grouped_prefix_shared_apply_output_triton(  # type: ignore[misc]
+                    xs["r"],
+                    xs["w"],
+                    xs["k"],
+                    xs["v"],
+                    xs["kk"],
+                    xs["a"],
+                    xs["state"],
+                    summary_got,
+                    chunk_size=int(chunk_size),
+                    group_size=group_size,
+                ),
+                device=args.device,
+                warmup=args.warmup,
+                steps=args.steps,
+            )
         recompute_prefix_probe = dplr_compact_wy_recompute_phase_probe_triton(  # type: ignore[misc]
             xs["r"],
             xs["w"],
@@ -952,6 +992,9 @@ def emit_compact_stage_probe(
         recompute_pair_diff = pair_diff(recompute_got, ref)
         prefix_shared_pair_diff = pair_diff(prefix_shared_got, ref)
         compact3_prefix_shared_pair_diff = pair_diff(compact3_prefix_shared_got, ref)
+        grouped_prefix_shared_pair_diff = {
+            int(group_size): pair_diff(got, ref) for group_size, got in grouped_prefix_shared_got.items()
+        }
 
         row = make_stage_row("compact_chunk_summary")
         row.update(
@@ -1122,6 +1165,23 @@ def emit_compact_stage_probe(
         )
         finish_timing_row(row, B=B, T=T, ms=compact3_prefix_shared_ms)
         emit_stage(row)
+
+        for group_size in grouped_prefix_shared_sizes:
+            group_size_i = int(group_size)
+            row = make_stage_row(f"compact_grouped_prefix_shared_g{group_size_i}", group_size=group_size_i)
+            row.update(
+                {
+                    "status": "pass",
+                    "state_source": "grouped_shared_prefix_no_start_states",
+                    "prefix_shared_serial_chunks": False,
+                    "prefix_shared_loses_chunk_parallelism": False,
+                    "prefix_shared_groups": int((T // int(chunk_size)) // group_size_i),
+                    "peak_vram_mb": _peak_mb(args.device),
+                    **grouped_prefix_shared_pair_diff[group_size_i],
+                }
+            )
+            finish_timing_row(row, B=B, T=T, ms=grouped_prefix_shared_ms[group_size_i])
+            emit_stage(row)
     except Exception as exc:
         for stage in stages:
             row = make_stage_row(stage)
@@ -1409,6 +1469,7 @@ def main() -> int:
             dplr_compact_wy_prefix_combine_torch,
             dplr_compact_wy_prefix_combine_triton,
             dplr_compact_wy_prefix_combine_triton_available,
+            dplr_compact_wy_grouped_prefix_shared_apply_output_triton,
             dplr_compact_wy_prefix_shared_apply_output_triton,
             dplr_compact_wy_recompute_phase_probe_triton,
             dplr_compact_wy_recompute_apply_output_triton,
@@ -1432,6 +1493,7 @@ def main() -> int:
         dplr_compact_wy_prefix_combine_torch = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_combine_triton = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_combine_triton_available = None  # type: ignore[assignment]
+        dplr_compact_wy_grouped_prefix_shared_apply_output_triton = None  # type: ignore[assignment]
         dplr_compact_wy_prefix_shared_apply_output_triton = None  # type: ignore[assignment]
         dplr_compact_wy_recompute_phase_probe_triton = None  # type: ignore[assignment]
         dplr_compact_wy_recompute_apply_output_triton = None  # type: ignore[assignment]
@@ -1673,6 +1735,7 @@ def main() -> int:
                         dplr_compact_wy_chunk_summary_triton=dplr_compact_wy_chunk_summary_triton,
                         dplr_compact_wy_prefix_combine_torch=dplr_compact_wy_prefix_combine_torch,
                         dplr_compact_wy_prefix_combine_triton=dplr_compact_wy_prefix_combine_triton,
+                        dplr_compact_wy_grouped_prefix_shared_apply_output_triton=dplr_compact_wy_grouped_prefix_shared_apply_output_triton,
                         dplr_compact_wy_prefix_shared_apply_output_triton=dplr_compact_wy_prefix_shared_apply_output_triton,
                         dplr_compact_wy_recompute_phase_probe_triton=dplr_compact_wy_recompute_phase_probe_triton,
                         dplr_compact_wy_recompute_apply_output_triton=dplr_compact_wy_recompute_apply_output_triton,
@@ -1725,6 +1788,7 @@ def main() -> int:
                                 "triton_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower() not in {"0", "false", "no", "off"} if (row.get("algorithm_family") == "triton_wy_compact") else None,
                                 "triton_compact_recompute_starts": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0").lower() not in {"0", "false", "no", "off"} if (row.get("algorithm_family") == "triton_wy_compact") else None,
                                 "triton_compact_prefix_shared": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED", "0").lower() not in {"0", "false", "no", "off"} if (row.get("algorithm_family") == "triton_wy_compact") else None,
+                                "triton_compact_prefix_shared_group_size": int(os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED_GROUP_SIZE", "0")) if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "peak_vram_mb": _peak_mb(args.device),
                             }
                         )
@@ -1756,6 +1820,7 @@ def main() -> int:
                                 "triton_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_recompute_starts": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_prefix_shared": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
+                                "triton_compact_prefix_shared_group_size": int(os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED_GROUP_SIZE", "0")) if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "ms": None,
                                 "tokps": None,
                                 "out_max_abs_diff": None,
@@ -1783,6 +1848,7 @@ def main() -> int:
                                 "triton_compact_output_only": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_OUTPUT_ONLY", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_recompute_starts": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_RECOMPUTE_STARTS", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "triton_compact_prefix_shared": os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED", "0").lower() not in {"0", "false", "no", "off"} if row.get("algorithm_family") == "triton_wy_compact" else None,
+                                "triton_compact_prefix_shared_group_size": int(os.environ.get("RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED_GROUP_SIZE", "0")) if row.get("algorithm_family") == "triton_wy_compact" else None,
                                 "ms": None,
                                 "tokps": None,
                                 "out_max_abs_diff": None,

@@ -860,7 +860,7 @@ Branch: `wangyue/native-prefill-060-albatross`
     below the `0.60x` stretch, so keep it opt-in. The next compact work must
     recover chunk-level parallelism without reintroducing dense starts; if that
     is not viable, route the Albatross gap back to the main fused fp16 line.
-- [ ] Next compact-WY/mainline routing task:
+- [x] Next compact-WY/mainline routing task:
   - Try one bounded prefix-shared parallelism recovery experiment only. The
     useful direction is a persistent/segmented producer-consumer schedule that
     shares chunk starts without global dense `start_states` and without
@@ -868,6 +868,55 @@ Branch: `wangyue/native-prefill-060-albatross`
     prefix-shared `20,205 tok/s` HF row or approach the main `27,051 tok/s`
     line, freeze compact-WY as a research/quantization track and move the next
     `0.60x` experiment back to main fused fp16 recurrent-scan/output.
+  - Done: added opt-in grouped prefix-shared schedule:
+    `RWKV7_DPLR_TRITON_COMPACT_PREFIX_SHARED_GROUP_SIZE=<1|2|4>`.
+    - new helper:
+      `dplr_compact_wy_grouped_prefix_shared_apply_output_triton(...)`;
+    - stage probe rows:
+      `compact_grouped_prefix_shared_g1`,
+      `compact_grouped_prefix_shared_g2`, and
+      `compact_grouped_prefix_shared_g4`;
+    - HF telemetry now records
+      `prefill_dplr_compact_prefix_shared_group_size`;
+    - default HF/native behavior remains unchanged.
+  - Validation:
+    - local no-torch gate: py_compile, `git diff --check`, and
+      `python tests/test_dplr_prefill_triton.py` skip/pass;
+    - 4090 gate: py_compile and `python tests/test_dplr_prefill_triton.py`
+      pass.
+  - Result files:
+    - synthetic:
+      `bench/results_4090_prefill060_dplr_compact_grouped_prefix_shared_20260703_075658.jsonl`
+      from remote
+      `/tmp/dplr_compact_grouped_prefix_shared_4090_20260703_075658.jsonl`;
+    - HF corrected smoke:
+      `bench/results_4090_prefill060_native_dplr_grouped_prefix_shared_20260703_075802.jsonl`
+      from remote
+      `/tmp/native_4090_dplr_grouped_prefix_shared_20260703_075802.jsonl`.
+  - 4090 synthetic `B=1,T=512,H=16,N=64,chunk=64,fp16`:
+    - serial prefix-shared stage: `0.16423 ms`;
+    - grouped `g1`: `0.50133 ms`;
+    - grouped `g2`: `0.34034 ms`;
+    - grouped `g4`: `0.26055 ms`;
+    - env-routed grouped `g4`: `0.40192 ms`, `1.274M tok/s`, pass.
+  - 4090 HF corrected smoke, 0.4B / prompt512 / bsz1:
+    - grouped `g4`: pass, `18,171.0 tok/s`, `28.1768 ms`, peak
+      `994.2 MiB`;
+    - this is below the previous prefix-shared compact row
+      `20,205.0 tok/s` and far below the main fused recurrent scan row
+      `27,051.0 tok/s`.
+  - conclusion: the bounded parallelism-recovery prototype did not beat
+    serial prefix sharing. Compact-WY is now frozen as an opt-in
+    research/quantization track for this branch. The next `0.60x` Albatross
+    work moves back to the main fused fp16 recurrent-scan/output path.
+- [ ] Next main fused-fp16 task:
+  - Resume the main Albatross-gap line instead of compact-WY. Start from the
+    strict confirmed 4090 row `27,051.0 tok/s` and profile/reduce the largest
+    remaining native prefill costs in the fused state-scan + fused-output path.
+    The next bounded experiment should target a real launch/memory boundary
+    on the main path and must compare against the same-run fused recurrent
+    scan baseline. Promotion gate: move toward `>=31,289 tok/s` without
+    breaking greedy/cache/decode smoke.
 - [ ] Stretch target remains `>=0.60x` Albatross (`>=31,289 tok/s`) for
   4090 / 0.4B / prompt512 / bsz1. Best current confirmed row on this branch is
   `27,051.0 tok/s` (`~0.5187x`), still about `15.7%` relative uplift short of
